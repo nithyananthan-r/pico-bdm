@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pico-bdm</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<header class="bench-header">
+  <div class="bench-title">
+    <span class="dot" id="conn-dot"></span>
+    <h1>pico-bdm</h1>
+    <span class="subtitle">background debug controller — S08/RS08</span>
+  </div>
+</header>
+
+<main class="bench">
+
+  <section class="module" id="module-connect">
+    <h2>Connection</h2>
+    <div class="row">
+      <select id="port-select"></select>
+      <button id="refresh-ports">Refresh</button>
+      <button id="connect-btn">Connect</button>
+      <button id="disconnect-btn" disabled>Disconnect</button>
+    </div>
+    <div class="row">
+      <button id="sync-btn" disabled>Sync target</button>
+      <span class="readout" id="sync-readout">not synced</span>
+    </div>
+  </section>
+
+  <section class="module" id="module-memory">
+    <h2>Memory</h2>
+    <div class="row">
+      <label>addr</label>
+      <input type="text" id="mem-addr" value="0xFFFE" class="mono">
+      <label>len</label>
+      <input type="text" id="mem-len" value="2" class="mono" style="width:4em">
+      <button id="mem-read-btn" disabled>Read</button>
+    </div>
+    <pre class="hexdump mono" id="mem-output">—</pre>
+    <div class="row">
+      <label>addr</label>
+      <input type="text" id="wb-addr" value="0x0080" class="mono">
+      <label>value</label>
+      <input type="text" id="wb-value" value="0x00" class="mono">
+      <button id="wb-btn" disabled>Write byte</button>
+    </div>
+  </section>
+
+  <section class="module" id="module-flash">
+    <h2>Flash</h2>
+    <div class="row">
+      <label>bus clock (Hz)</label>
+      <input type="text" id="bus-freq" value="8000000" class="mono">
+    </div>
+    <div class="row">
+      <input type="file" id="srec-file" accept=".s19,.s28,.s37,.srec">
+      <button id="flash-btn" disabled>Program</button>
+    </div>
+    <div class="row">
+      <button id="mass-erase-btn" class="danger" disabled>Mass erase</button>
+    </div>
+    <pre class="hexdump mono" id="flash-output">—</pre>
+  </section>
+
+  <section class="module" id="module-scope">
+    <h2>Scope <span class="hint">(self-capture — no logic analyzer needed)</span></h2>
+    <div class="row">
+      <label>test</label>
+      <select id="scope-test" class="mono">
+        <option value="sync">SYNC pulse</option>
+        <option value="write_bit">write bit</option>
+        <option value="read_bit">read bit</option>
+      </select>
+      <label id="scope-bit-label" style="display:none">bit</label>
+      <select id="scope-bit" class="mono" style="display:none">
+        <option value="1">1</option>
+        <option value="0">0</option>
+      </select>
+      <button id="scope-run-btn" disabled>Capture</button>
+    </div>
+    <canvas id="scope-canvas" width="900" height="140"></canvas>
+    <div class="readout" id="scope-readout">—</div>
+  </section>
+
+  <section class="module" id="module-log">
+    <h2>Log</h2>
+    <pre class="log mono" id="log"></pre>
+  </section>
+
+</main>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
