@@ -195,3 +195,4 @@ Errors: `{"ok": false, "error": "message"}`.
   Controller (S08BDCV1) — not fully available via public web search at time
   of writing; worth requesting from NXP or finding via your usual embedded
   documentation channels.
+# pico-bdm
