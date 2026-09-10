@@ -80,6 +80,36 @@ class BdmClient:
     def read_status(self):
         return self._call({"cmd": "read_status"})["value"]
 
+    def go(self):
+        self._call({"cmd": "go"})
+
+    def step(self):
+        self._call({"cmd": "step"})
+
+    def tagged_go(self):
+        self._call({"cmd": "tagged_go"})
+
+    def write_control(self, value):
+        self._call({"cmd": "write_control", "value": value})
+
+    def read_bkpt(self):
+        return self._call({"cmd": "read_bkpt"})["value"]
+
+    def write_bkpt(self, addr):
+        self._call({"cmd": "write_bkpt", "addr": addr})
+
+    def read_reg(self, reg):
+        return self._call({"cmd": "read_reg", "reg": reg})["value"]
+
+    def write_reg(self, reg, value):
+        self._call({"cmd": "write_reg", "reg": reg, "value": value})
+
+    def reset_target(self):
+        self._call({"cmd": "reset_target"})
+
+    def blank_check(self):
+        return self._call({"cmd": "blank_check"}, timeout=5)["blank"]
+
     def flash_init_clock(self, bus_freq_hz):
         self._call({"cmd": "flash_init_clock", "bus_freq_hz": bus_freq_hz})
 

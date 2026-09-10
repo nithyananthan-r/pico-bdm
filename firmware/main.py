@@ -72,6 +72,39 @@ def handle(cmd):
         bdc.go()
         return ok()
 
+    if name == "step":
+        bdc.trace1()
+        return ok()
+
+    if name == "tagged_go":
+        bdc.tagged_go()
+        return ok()
+
+    if name == "write_control":
+        bdc.write_control(cmd["value"])
+        return ok()
+
+    if name == "read_bkpt":
+        return ok(value=bdc.read_bkpt())
+
+    if name == "write_bkpt":
+        bdc.write_bkpt(cmd["addr"])
+        return ok()
+
+    if name == "read_reg":
+        return ok(value=bdc.read_reg(cmd["reg"]))
+
+    if name == "write_reg":
+        bdc.write_reg(cmd["reg"], cmd["value"])
+        return ok()
+
+    if name == "reset_target":
+        bdc.reset_target()
+        return ok()
+
+    if name == "blank_check":
+        return ok(blank=bdc.flash_blank_check())
+
     if name == "flash_init_clock":
         bdc.flash_init_clock(cmd["bus_freq_hz"])
         return ok()

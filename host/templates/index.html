@@ -16,7 +16,45 @@
     <h1>pico-bdm</h1>
     <span class="subtitle">background debug controller — S08/RS08</span>
   </div>
+  <div class="bench-header-right">
+    <button id="advanced-toggle" class="link-btn" type="button" aria-pressed="false">Show advanced ▸</button>
+    <button id="guide-btn" class="info-btn" type="button" aria-label="how to use this page">i</button>
+    <label for="theme-select" class="hint">theme</label>
+    <select id="theme-select" class="theme-select">
+      <option value="amber">Amber Bench</option>
+      <option value="terminal">Terminal Green</option>
+      <option value="nord">Nord</option>
+      <option value="dracula">Dracula</option>
+      <option value="paper">Paper (light)</option>
+    </select>
+  </div>
 </header>
+
+<div id="guide-modal" class="modal-backdrop" hidden>
+  <div class="modal-panel">
+    <div class="modal-header">
+      <h2>Using pico-bdm</h2>
+      <button id="guide-close-btn" class="info-btn" type="button" aria-label="close guide">x</button>
+    </div>
+    <p class="hint">Typical order: <b>Connect</b> → <b>Sync target</b> → <b>Program</b> or read/write memory. Watch the <b>Log</b> panel for what actually happened.</p>
+    <dl>
+      <dt>Connection</dt>
+      <dd>Pick your Pico's serial port (Refresh if it's missing) and click Connect. Once connected, click <b>Sync target</b> to measure the target chip's BDC clock — do this before any read, write, or program. <b>Reset target</b> is a plain RESET pulse (target reboots and runs its own code); <b>Go</b> resumes execution from BDM.</dd>
+      <dt>Flash</dt>
+      <dd>Set the target's bus clock in Hz and pick an erase mode: erase only the pages you're about to write (default), mass-erase the whole chip first, or skip erasing entirely. Choose a compiled <code>.s19</code>/<code>.srec</code> file and click Program. <b>Verify after write</b> reads each region back and confirms it matches. <b>Run target after programming</b> resumes the target's own code once flashing finishes. <b>Blank check</b> asks the FLASH module itself whether the chip is erased. The standalone <b>Mass erase</b> button wipes the whole chip's FLASH on its own — irreversible, used rarely.</dd>
+      <dt>Memory <span class="hint">(under "Show advanced")</span></dt>
+      <dd>Read or write a single byte/block at a given address once synced — useful for peeking at registers or poking test values by hand.</dd>
+      <dt>Registers &amp; breakpoint <span class="hint">(under "Show advanced")</span></dt>
+      <dd>Read/write the CPU's A, CCR, PC, H:X and SP registers directly. Set a hardware breakpoint address (BKPT) and use <b>Tagged GO</b> to run until it's hit, or <b>Step</b> to single-step one instruction at a time. <b>BDCSCR</b> is the BDC's own status/control register — writing it can clear sticky flags or change the clock-switch bit.</dd>
+      <dt>Scope <span class="hint">(under "Show advanced")</span></dt>
+      <dd>Self-capture diagnostic panel that draws the actual BKGD waveform without needing a separate logic analyzer. <b>Currently disabled</b> — it hangs the Pico and needs a hardware-level fix; see CONTEXT.md.</dd>
+      <dt>Options</dt>
+      <dd>Log display preferences (auto-scroll, timestamps) and the sample count Scope will use once it's re-enabled. Erase/verify/run-after-program options live directly in the Flash panel.</dd>
+      <dt>Log</dt>
+      <dd>Running history of every command sent and its result, newest at the bottom. Clear wipes it.</dd>
+    </dl>
+  </div>
+</div>
 
 <main class="bench">
 
@@ -32,6 +70,39 @@
       <button id="sync-btn" disabled>Sync target</button>
       <span class="readout" id="sync-readout">not synced</span>
     </div>
+    <div class="row">
+      <button id="reset-target-btn" disabled title="plain RESET pulse — target reboots and runs its own code, does NOT halt into BDM">Reset target</button>
+      <button id="go-btn" disabled title="resume execution (BDC GO)">Go</button>
+    </div>
+  </section>
+
+  <section class="module" id="module-flash">
+    <h2>Flash</h2>
+    <div class="row">
+      <label>bus clock (Hz)</label>
+      <input type="text" id="bus-freq" value="8000000" class="mono">
+      <label>erase</label>
+      <select id="erase-mode" class="mono">
+        <option value="pages" selected>touched pages</option>
+        <option value="mass">mass erase first</option>
+        <option value="none">don't erase</option>
+      </select>
+    </div>
+    <div class="row checkbox-row">
+      <input type="checkbox" id="opt-verify" checked>
+      <label for="opt-verify">Verify after write</label>
+      <input type="checkbox" id="opt-run-after">
+      <label for="opt-run-after">Run target after programming</label>
+    </div>
+    <div class="row">
+      <input type="file" id="srec-file" accept=".s19,.s28,.s37,.srec">
+      <button id="flash-btn" disabled>Program</button>
+    </div>
+    <div class="row">
+      <button id="mass-erase-btn" class="danger" disabled>Mass erase</button>
+      <button id="blank-check-btn" disabled>Blank check</button>
+    </div>
+    <pre class="hexdump mono" id="flash-output">—</pre>
   </section>
 
   <section class="module" id="module-memory">
@@ -53,24 +124,11 @@
     </div>
   </section>
 
-  <section class="module" id="module-flash">
-    <h2>Flash</h2>
-    <div class="row">
-      <label>bus clock (Hz)</label>
-      <input type="text" id="bus-freq" value="8000000" class="mono">
-    </div>
-    <div class="row">
-      <input type="file" id="srec-file" accept=".s19,.s28,.s37,.srec">
-      <button id="flash-btn" disabled>Program</button>
-    </div>
-    <div class="row">
-      <button id="mass-erase-btn" class="danger" disabled>Mass erase</button>
-    </div>
-    <pre class="hexdump mono" id="flash-output">—</pre>
-  </section>
-
   <section class="module" id="module-scope">
     <h2>Scope <span class="hint">(self-capture — no logic analyzer needed)</span></h2>
+    <div class="row">
+      <span class="warn">⚠ disabled: capture currently hangs the Pico (needs a hardware fix) — see CONTEXT.md</span>
+    </div>
     <div class="row">
       <label>test</label>
       <select id="scope-test" class="mono">
@@ -83,14 +141,62 @@
         <option value="1">1</option>
         <option value="0">0</option>
       </select>
-      <button id="scope-run-btn" disabled>Capture</button>
+      <button id="scope-run-btn" disabled title="disabled: capture currently hangs the Pico, see CONTEXT.md">Capture</button>
     </div>
     <canvas id="scope-canvas" width="900" height="140"></canvas>
     <div class="readout" id="scope-readout">—</div>
   </section>
 
+  <section class="module" id="module-registers">
+    <h2>Registers &amp; breakpoint <span class="hint">(CPU state — requires sync)</span></h2>
+    <div class="row">
+      <label>reg</label>
+      <select id="reg-select" class="mono">
+        <option value="PC">PC</option>
+        <option value="A">A</option>
+        <option value="CCR">CCR</option>
+        <option value="HX">H:X</option>
+        <option value="SP">SP</option>
+      </select>
+      <label>value</label>
+      <input type="text" id="reg-value" value="0x0000" class="mono">
+      <button id="reg-read-btn" disabled>Read</button>
+      <button id="reg-write-btn" disabled>Write</button>
+    </div>
+    <div class="row">
+      <label>breakpoint addr</label>
+      <input type="text" id="bkpt-addr" value="0x0000" class="mono">
+      <button id="bkpt-read-btn" disabled>Read BKPT</button>
+      <button id="bkpt-write-btn" disabled>Set BKPT</button>
+      <button id="step-btn" disabled title="single-step one instruction (TRACE1)">Step</button>
+      <button id="tagged-go-btn" disabled title="resume with breakpoint tagging armed (TAGGO)">Tagged GO</button>
+    </div>
+    <div class="row">
+      <label>BDCSCR</label>
+      <input type="text" id="control-value" value="0x00" class="mono" style="width:5em">
+      <button id="control-read-btn" disabled>Read</button>
+      <button id="control-write-btn" disabled title="write BDCSCR directly — clears sticky WS/WSF/DVF flags, sets CLKSW, etc.">Write</button>
+    </div>
+  </section>
+
+  <section class="module" id="module-options">
+    <h2>Options</h2>
+    <div class="row checkbox-row">
+      <input type="checkbox" id="opt-autoscroll" checked>
+      <label for="opt-autoscroll">Auto-scroll log</label>
+    </div>
+    <div class="row checkbox-row">
+      <input type="checkbox" id="opt-timestamps" checked>
+      <label for="opt-timestamps">Log timestamps</label>
+    </div>
+    <div class="row">
+      <label for="opt-sample-count">scope samples</label>
+      <input type="text" id="opt-sample-count" value="256" class="mono" style="width:5em">
+    </div>
+  </section>
+
   <section class="module" id="module-log">
-    <h2>Log</h2>
+    <h2>Log <button id="log-clear-btn" class="link-btn">Clear</button></h2>
     <pre class="log mono" id="log"></pre>
   </section>
 

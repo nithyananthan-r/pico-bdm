@@ -6,11 +6,58 @@ const logEl = $("log");
 function log(msg, cls) {
   const line = document.createElement("div");
   if (cls) line.className = cls;
-  const ts = new Date().toLocaleTimeString();
-  line.textContent = `[${ts}] ${msg}`;
+  line.textContent = $("opt-timestamps").checked
+    ? `[${new Date().toLocaleTimeString()}] ${msg}`
+    : msg;
   logEl.appendChild(line);
-  logEl.scrollTop = logEl.scrollHeight;
+  if ($("opt-autoscroll").checked) logEl.scrollTop = logEl.scrollHeight;
 }
+
+// -- theme switcher -----------------------------------------------------
+const THEME_KEY = "pico-bdm-theme";
+function applyTheme(name) {
+  document.documentElement.setAttribute("data-theme", name);
+  localStorage.setItem(THEME_KEY, name);
+}
+$("theme-select").value = localStorage.getItem(THEME_KEY) || "amber";
+applyTheme($("theme-select").value);
+$("theme-select").addEventListener("change", (e) => applyTheme(e.target.value));
+
+// -- advanced (Memory/Scope) toggle ---------------------------------------
+const ADVANCED_KEY = "pico-bdm-advanced";
+const benchEl = document.querySelector(".bench");
+const advancedToggle = $("advanced-toggle");
+function setAdvanced(show) {
+  benchEl.classList.toggle("show-advanced", show);
+  document.body.classList.toggle("advanced-scroll", show);
+  advancedToggle.textContent = show ? "Hide advanced ▾" : "Show advanced ▸";
+  advancedToggle.setAttribute("aria-pressed", String(show));
+  localStorage.setItem(ADVANCED_KEY, show ? "1" : "0");
+}
+setAdvanced(localStorage.getItem(ADVANCED_KEY) === "1");
+advancedToggle.addEventListener("click", () =>
+  setAdvanced(!benchEl.classList.contains("show-advanced"))
+);
+
+// -- "how to use this page" guide modal ----------------------------------
+const guideModal = $("guide-modal");
+const guideBtn = $("guide-btn");
+function openGuide() {
+  guideModal.hidden = false;
+  guideBtn.classList.add("active");
+}
+function closeGuide() {
+  guideModal.hidden = true;
+  guideBtn.classList.remove("active");
+}
+guideBtn.addEventListener("click", openGuide);
+$("guide-close-btn").addEventListener("click", closeGuide);
+guideModal.addEventListener("click", (e) => {
+  if (e.target === guideModal) closeGuide();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !guideModal.hidden) closeGuide();
+});
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
@@ -24,7 +71,9 @@ function setConnected(connected) {
   $("disconnect-btn").disabled = !connected;
   $("connect-btn").disabled = connected;
   $("sync-btn").disabled = !connected;
-  $("scope-run-btn").disabled = !connected;
+  $("reset-target-btn").disabled = !connected;
+  // scope-run-btn stays disabled regardless of connection state -- capture
+  // currently hangs the Pico, see CONTEXT.md.
 }
 
 function setSynced(synced) {
@@ -32,6 +81,16 @@ function setSynced(synced) {
   $("wb-btn").disabled = !synced;
   $("flash-btn").disabled = !synced;
   $("mass-erase-btn").disabled = !synced;
+  $("blank-check-btn").disabled = !synced;
+  $("go-btn").disabled = !synced;
+  $("reg-read-btn").disabled = !synced;
+  $("reg-write-btn").disabled = !synced;
+  $("bkpt-read-btn").disabled = !synced;
+  $("bkpt-write-btn").disabled = !synced;
+  $("step-btn").disabled = !synced;
+  $("tagged-go-btn").disabled = !synced;
+  $("control-read-btn").disabled = !synced;
+  $("control-write-btn").disabled = !synced;
 }
 
 async function refreshPorts() {
@@ -92,6 +151,26 @@ $("sync-btn").addEventListener("click", async () => {
   }
 });
 
+$("reset-target-btn").addEventListener("click", async () => {
+  try {
+    await api("/api/reset_target", { method: "POST" });
+    setSynced(false);
+    $("sync-readout").textContent = "not synced";
+    log("target reset (plain RESET pulse — running its own code)", "ok");
+  } catch (e) {
+    log(e.message, "err");
+  }
+});
+
+$("go-btn").addEventListener("click", async () => {
+  try {
+    await api("/api/go", { method: "POST" });
+    log("target resumed (GO)", "ok");
+  } catch (e) {
+    log(e.message, "err");
+  }
+});
+
 $("mem-read-btn").addEventListener("click", async () => {
   const addr = $("mem-addr").value;
   const len = $("mem-len").value;
@@ -137,6 +216,15 @@ $("mass-erase-btn").addEventListener("click", async () => {
   }
 });
 
+$("blank-check-btn").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/blank_check", { method: "POST" });
+    log(data.blank ? "blank check: chip is erased" : "blank check: chip is NOT blank", data.blank ? "ok" : "err");
+  } catch (e) {
+    log(e.message, "err");
+  }
+});
+
 $("flash-btn").addEventListener("click", async () => {
   const fileInput = $("srec-file");
   if (!fileInput.files.length) return log("choose a .s19 file first", "err");
@@ -145,6 +233,8 @@ $("flash-btn").addEventListener("click", async () => {
   const form = new FormData();
   form.append("file", fileInput.files[0]);
   form.append("bus_freq_hz", busFreq);
+  form.append("erase_mode", $("erase-mode").value);
+  form.append("verify", $("opt-verify").checked ? "1" : "0");
 
   try {
     log(`programming ${fileInput.files[0].name}...`);
@@ -153,6 +243,110 @@ $("flash-btn").addEventListener("click", async () => {
     if (!data.ok) throw new Error(data.error);
     $("flash-output").textContent = JSON.stringify(data.chunks, null, 2);
     log(`programmed ${data.total_bytes} bytes across ${data.chunks.length} region(s)`, "ok");
+
+    if ($("opt-run-after").checked) {
+      await api("/api/go", { method: "POST" });
+      log("target resumed (GO)", "ok");
+    }
+  } catch (e) {
+    log(e.message, "err");
+  }
+});
+
+// -- Registers & breakpoint ---------------------------------------------
+
+function parseNum(s) {
+  return parseInt(s, s.trim().toLowerCase().startsWith("0x") ? 16 : 10);
+}
+
+$("reg-read-btn").addEventListener("click", async () => {
+  const reg = $("reg-select").value;
+  try {
+    const data = await api(`/api/reg?reg=${encodeURIComponent(reg)}`);
+    const width = reg === "A" || reg === "CCR" ? 2 : 4;
+    $("reg-value").value = "0x" + data.value.toString(16).toUpperCase().padStart(width, "0");
+    log(`${reg} = 0x${data.value.toString(16).toUpperCase()}`, "ok");
+  } catch (e) {
+    log(e.message, "err");
+  }
+});
+
+$("reg-write-btn").addEventListener("click", async () => {
+  const reg = $("reg-select").value;
+  const value = parseNum($("reg-value").value);
+  try {
+    await api("/api/reg", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reg, value }),
+    });
+    log(`wrote ${reg} = 0x${value.toString(16).toUpperCase()}`, "ok");
+  } catch (e) {
+    log(e.message, "err");
+  }
+});
+
+$("bkpt-read-btn").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/bkpt");
+    $("bkpt-addr").value = "0x" + data.addr.toString(16).toUpperCase().padStart(4, "0");
+    log(`BKPT = 0x${data.addr.toString(16).toUpperCase()}`, "ok");
+  } catch (e) {
+    log(e.message, "err");
+  }
+});
+
+$("bkpt-write-btn").addEventListener("click", async () => {
+  const addr = parseNum($("bkpt-addr").value);
+  try {
+    await api("/api/bkpt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ addr }),
+    });
+    log(`BKPT set to 0x${addr.toString(16).toUpperCase()}`, "ok");
+  } catch (e) {
+    log(e.message, "err");
+  }
+});
+
+$("step-btn").addEventListener("click", async () => {
+  try {
+    await api("/api/step", { method: "POST" });
+    log("stepped one instruction", "ok");
+  } catch (e) {
+    log(e.message, "err");
+  }
+});
+
+$("tagged-go-btn").addEventListener("click", async () => {
+  try {
+    await api("/api/tagged_go", { method: "POST" });
+    log("resumed with breakpoint tagging armed (TAGGO)", "ok");
+  } catch (e) {
+    log(e.message, "err");
+  }
+});
+
+$("control-read-btn").addEventListener("click", async () => {
+  try {
+    const data = await api("/api/control");
+    $("control-value").value = "0x" + data.value.toString(16).toUpperCase().padStart(2, "0");
+    log(`BDCSCR = 0x${data.value.toString(16).toUpperCase()}`, "ok");
+  } catch (e) {
+    log(e.message, "err");
+  }
+});
+
+$("control-write-btn").addEventListener("click", async () => {
+  const value = parseNum($("control-value").value);
+  try {
+    await api("/api/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ value }),
+    });
+    log(`wrote BDCSCR = 0x${value.toString(16).toUpperCase()}`, "ok");
   } catch (e) {
     log(e.message, "err");
   }
@@ -225,11 +419,12 @@ function drawWaveform(samples, samplePeriodNs) {
 $("scope-run-btn").addEventListener("click", async () => {
   const test = $("scope-test").value;
   const bit = parseInt($("scope-bit").value, 10);
+  const sampleCount = parseInt($("opt-sample-count").value, 10) || 256;
   try {
     const data = await api("/api/capture", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ test, sample_count: 256, bit }),
+      body: JSON.stringify({ test, sample_count: sampleCount, bit }),
     });
     drawWaveform(data.samples, data.sample_period_ns);
     let readout = `${data.samples.length} samples @ ${data.sample_period_ns} ns/sample`;
@@ -241,6 +436,10 @@ $("scope-run-btn").addEventListener("click", async () => {
   } catch (e) {
     log(e.message, "err");
   }
+});
+
+$("log-clear-btn").addEventListener("click", () => {
+  logEl.innerHTML = "";
 });
 
 refreshPorts().catch((e) => log(e.message, "err"));

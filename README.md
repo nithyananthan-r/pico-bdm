@@ -82,12 +82,17 @@ independent hardware:
 
 ## Wiring
 
-| Pico pin        | Target pin (per S9S08SG8 20-TSSOP)      |
-|------------------|------------------------------------------|
-| GPIO (BKGD_PIN)  | BKGD/MS (pin 2)                            |
-| GPIO (RESET_PIN) | RESET (pin 1)                              |
-| GND              | VSS                                        |
-| 3V3 (see note)   | VDD                                        |
+Confirmed against the MC9S08SG8/SG4 datasheet, Table 2-1 / Figure 2-1
+(20-Pin TSSOP) — same pinout for both the SG8 and SG4 (they only differ in
+FLASH/RAM size, not pin assignment):
+
+| Pico pin        | Target pin (20-TSSOP)                      |
+|------------------|--------------------------------------------|
+| GPIO (BKGD_PIN)  | pin 2 — BKGD/MS                            |
+| GPIO (RESET_PIN) | pin 1 — RESET                              |
+| GND              | pin 4 — VSS                                |
+| 3V3 (see note)   | pin 3 — VDD                                |
+| —                | pins 5–20: Port A/B/C I/O, not needed for bring-up, safe to leave floating |
 
 **Power note:** run the target at **3.3V**, not 5V. The S9S08SG8 datasheet
 specifies a 2.7–5.5V operating range, so 3.3V is within spec and lets you
@@ -100,6 +105,20 @@ Add a **10kΩ pull-up from BKGD to target VDD** even though the datasheet
 says the target has an internal one — it makes the line more robust during
 early bring-up and doesn't hurt.
 
+Add a **0.1µF ceramic decoupling capacitor directly across VDD (pin 3) and
+VSS (pin 4)**, as close to the chip as physically possible — datasheet
+§2.2.1 calls this out explicitly as needed for reliable operation, not
+just best practice. A larger bulk capacitor (e.g. 10µF) on the supply rail
+is recommended too if the wire run from the Pico's 3V3 pin is long.
+
+Datasheet §2.2.3 also confirms something the firmware already assumes:
+**RESET alone cannot force BDM mode** — "RESET pin can only be used to
+reset into user mode, you can not enter BDM using RESET pin. BDM can be
+entered by holding MS [BKGD] low during POR or writing a 1 to BDFR in
+SBDFR with MS low after issuing BDM command." This matches
+`hardware_reset_to_bdm()` in `firmware/bdc.py`, which holds BKGD low
+across a RESET pulse for exactly this reason.
+
 Both RESET and BKGD are open-drain-style — the Pico code always sets a pin
 to "input" (never drives it high) and only ever drives it low, exactly like
 the pod hardware does.
@@ -109,6 +128,10 @@ the pod hardware does.
 ```
 pico-bdm/
 ├── README.md                 <- you are here
+├── CONTEXT.md                 <- project history, design decisions, and
+│                                  what's verified vs. not — read this
+│                                  before continuing work in a fresh chat
+│                                  or in Claude Code
 ├── firmware/
 │   ├── main.py                <- runs on the Pico; serial command dispatcher
 │   ├── bdc_pio.py              <- PIO programs: sync, write-bit, read-bit
@@ -170,8 +193,39 @@ Newline-delimited JSON, host always initiates:
 
 --> {"cmd": "mass_erase"}
 <-- {"ok": true}
+
+--> {"cmd": "read_reg", "reg": "PC"}
+<-- {"ok": true, "value": 65534}
+
+--> {"cmd": "write_reg", "reg": "A", "value": 255}
+<-- {"ok": true}
+
+--> {"cmd": "read_bkpt"}
+<-- {"ok": true, "value": 0}
+
+--> {"cmd": "write_bkpt", "addr": 4096}
+<-- {"ok": true}
+
+--> {"cmd": "step"}
+<-- {"ok": true}
+
+--> {"cmd": "tagged_go"}
+<-- {"ok": true}
+
+--> {"cmd": "write_control", "value": 0}
+<-- {"ok": true}
+
+--> {"cmd": "reset_target"}
+<-- {"ok": true}
+
+--> {"cmd": "blank_check"}
+<-- {"ok": true, "blank": true}
 ```
 Errors: `{"ok": false, "error": "message"}`.
+
+`reg` for `read_reg`/`write_reg` is one of `"A"`, `"CCR"`, `"PC"`, `"HX"`
+(H:X), `"SP"`. `read_status` reads the same BDCSCR register `write_control`
+writes.
 
 ## Status / what's implemented vs. what's a stub
 

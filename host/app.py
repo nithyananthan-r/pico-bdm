@@ -103,6 +103,97 @@ def api_mass_erase():
         return api_error(e)
 
 
+@app.route("/api/go", methods=["POST"])
+def api_go():
+    try:
+        client.go()
+        return jsonify({"ok": True})
+    except BdmClientError as e:
+        return api_error(e)
+
+
+@app.route("/api/step", methods=["POST"])
+def api_step():
+    try:
+        client.step()
+        return jsonify({"ok": True})
+    except BdmClientError as e:
+        return api_error(e)
+
+
+@app.route("/api/tagged_go", methods=["POST"])
+def api_tagged_go():
+    try:
+        client.tagged_go()
+        return jsonify({"ok": True})
+    except BdmClientError as e:
+        return api_error(e)
+
+
+@app.route("/api/reset_target", methods=["POST"])
+def api_reset_target():
+    try:
+        client.reset_target()
+        return jsonify({"ok": True})
+    except BdmClientError as e:
+        return api_error(e)
+
+
+@app.route("/api/blank_check", methods=["POST"])
+def api_blank_check():
+    try:
+        blank = client.blank_check()
+        return jsonify({"ok": True, "blank": blank})
+    except BdmClientError as e:
+        return api_error(e)
+
+
+@app.route("/api/control", methods=["GET", "POST"])
+def api_control():
+    """GET reads BDCSCR (same register read_status exposes); POST writes it
+    -- e.g. to clear sticky WS/WSF/DVF flags or change CLKSW."""
+    try:
+        if request.method == "GET":
+            return jsonify({"ok": True, "value": client.read_status()})
+        value = request.json["value"]
+        client.write_control(value)
+        return jsonify({"ok": True})
+    except (BdmClientError, KeyError, ValueError) as e:
+        return api_error(e)
+
+
+@app.route("/api/bkpt", methods=["GET", "POST"])
+def api_bkpt():
+    try:
+        if request.method == "GET":
+            return jsonify({"ok": True, "addr": client.read_bkpt()})
+        addr = request.json["addr"]
+        client.write_bkpt(addr)
+        return jsonify({"ok": True})
+    except (BdmClientError, KeyError, ValueError) as e:
+        return api_error(e)
+
+
+@app.route("/api/reg")
+def api_reg_read():
+    try:
+        reg = request.args["reg"]
+        return jsonify({"ok": True, "reg": reg, "value": client.read_reg(reg)})
+    except (BdmClientError, KeyError, ValueError) as e:
+        return api_error(e)
+
+
+@app.route("/api/reg", methods=["POST"])
+def api_reg_write():
+    try:
+        reg = request.json["reg"]
+        value = request.json["value"]
+        client.write_reg(reg, value)
+        return jsonify({"ok": True})
+    except (BdmClientError, KeyError, ValueError) as e:
+        return api_error(e)
+
+
 @app.route("/api/capture", methods=["POST"])
 def api_capture():
     try:
@@ -125,6 +216,10 @@ def api_flash_srec():
     """
     try:
         bus_freq_hz = int(request.form.get("bus_freq_hz", "8000000"))
+        erase_mode = request.form.get("erase_mode", "pages")  # pages | mass | none
+        if erase_mode not in ("pages", "mass", "none"):
+            return api_error("erase_mode must be 'pages', 'mass', or 'none'")
+        verify = request.form.get("verify", "1") not in ("0", "false", "")
         f = request.files["file"]
         text = f.read().decode()
         chunks = merge_contiguous(parse_srec(text))
@@ -133,11 +228,21 @@ def api_flash_srec():
 
         client.flash_init_clock(bus_freq_hz)
 
+        if erase_mode == "mass":
+            client.mass_erase()
+        erase_pages = erase_mode == "pages"
+
         results = []
         total = 0
         for addr, data in chunks:
-            n = client.flash_write(addr, data, erase_pages=True)
+            n = client.flash_write(addr, data, erase_pages=erase_pages)
             total += n
+            if verify:
+                readback = client.read_block(addr, len(data))
+                if bytes(readback) != bytes(data):
+                    raise BdmClientError(
+                        "verify failed: region at 0x%04X doesn't match after write" % addr
+                    )
             results.append({"addr": addr, "len": n})
 
         return jsonify({"ok": True, "chunks": results, "total_bytes": total})

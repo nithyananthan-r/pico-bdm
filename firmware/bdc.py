@@ -101,7 +101,6 @@ class Bdc:
         self.sm_id = sm_id
         self.target_freq_hz = None
         self.sm_freq = None
-        self._sm = None
 
     # -- low level pin control -------------------------------------------
     def _reset_assert(self):
@@ -109,6 +108,15 @@ class Bdc:
 
     def _reset_release(self):
         self.reset.init(Pin.IN)  # let external/internal pull-up bring it high
+
+    def reset_target(self, settle_ms=5):
+        """Plain RESET pulse -- does NOT force active background mode, so
+        the target just reboots and runs its own code normally. Use
+        hardware_reset_to_bdm() instead when you want it to halt into BDM."""
+        self._reset_assert()
+        time.sleep_ms(settle_ms)
+        self._reset_release()
+        time.sleep_ms(settle_ms)
 
     def hardware_reset_to_bdm(self, settle_ms=5):
         """Hold BKGD low across a RESET pulse to force active background
@@ -175,16 +183,9 @@ class Bdc:
         return self.target_freq_hz
 
     # -- bit-level tx/rx, built on the PIO byte helpers ---------------------
-    def _tx_sm(self):
-        if self._sm is None:
-            if self.sm_freq is None:
-                raise BdcError("call sync() before any tx/rx operation")
-            self._sm = make_state_machine(
-                bdc_write_bit, self.bkgd_pin_num, self.sm_freq
-            )
-        return self._sm
-
     def _write_bit(self, bit):
+        if self.sm_freq is None:
+            raise BdcError("call sync() before any tx/rx operation")
         sm = make_state_machine(bdc_write_bit, self.bkgd_pin_num, self.sm_freq)
         sm.active(1)
         k = PIO_CYCLES_PER_TARGET_CYCLE
@@ -195,6 +196,8 @@ class Bdc:
         sm.active(0)
 
     def _read_bit(self):
+        if self.sm_freq is None:
+            raise BdcError("call sync() before any tx/rx operation")
         sm = make_state_machine(bdc_read_bit, self.bkgd_pin_num, self.sm_freq)
         sm.active(1)
         k = PIO_CYCLES_PER_TARGET_CYCLE
@@ -316,6 +319,70 @@ class Bdc:
     def go(self):
         self._write_byte_raw(CMD_GO)
 
+    def trace1(self):
+        """Single-step one target instruction, per the BDC TRACE1 command."""
+        self._write_byte_raw(CMD_TRACE1)
+
+    def tagged_go(self):
+        """Resume execution with breakpoint tagging enabled -- the target
+        halts back into BDM when it fetches the opcode at the address last
+        written via write_bkpt(). Requires the target's own tagging enable
+        (see write_control/BDCSCR) to actually be armed; see opcode
+        disclaimer at the top of this file."""
+        self._write_byte_raw(CMD_TAGGO)
+
+    def write_control(self, value):
+        """Write the BDC status/control register (BDCSCR) directly -- e.g.
+        to clear sticky WS/WSF/DVF flags or change CLKSW. Same register
+        read_status() reads."""
+        self._write_byte_raw(CMD_WRITE_CONTROL)
+        self._write_byte_raw(value & 0xFF)
+
+    def read_bkpt(self):
+        self._write_byte_raw(CMD_READ_BKPT)
+        v = 0
+        for _ in range(16):
+            v = (v << 1) | self._read_bit()
+        return v
+
+    def write_bkpt(self, addr):
+        self._write_byte_raw(CMD_WRITE_BKPT)
+        self._write_word_raw(addr)
+
+    # -- CPU register access ---------------------------------------------
+    # (opcode, is_word) per register name -- PC/HX/SP are 16-bit, A/CCR 8-bit
+    _CPU_REGS = {
+        "A":   (CMD_READ_A,  CMD_WRITE_A,  False),
+        "CCR": (CMD_READ_CCR, CMD_WRITE_CCR, False),
+        "PC":  (CMD_READ_PC, CMD_WRITE_PC, True),
+        "HX":  (CMD_READ_HX, CMD_WRITE_HX, True),
+        "SP":  (CMD_READ_SP, CMD_WRITE_SP, True),
+    }
+
+    def read_reg(self, name):
+        try:
+            read_op, _, is_word = self._CPU_REGS[name]
+        except KeyError:
+            raise BdcError("unknown register: %r" % name)
+        self._write_byte_raw(read_op)
+        if is_word:
+            v = 0
+            for _ in range(16):
+                v = (v << 1) | self._read_bit()
+            return v
+        return self._read_byte_raw()
+
+    def write_reg(self, name, value):
+        try:
+            _, write_op, is_word = self._CPU_REGS[name]
+        except KeyError:
+            raise BdcError("unknown register: %r" % name)
+        self._write_byte_raw(write_op)
+        if is_word:
+            self._write_word_raw(value)
+        else:
+            self._write_byte_raw(value & 0xFF)
+
     def read_block(self, addr, length):
         return bytes(self.read_byte(addr + i) for i in range(length))
 
@@ -375,6 +442,14 @@ class Bdc:
 
     def flash_mass_erase(self):
         self._flash_command(0xFFFF, 0xFF, FCMD_MASS_ERASE)
+
+    def flash_blank_check(self):
+        """Run the FLASH module's own blank-check command and return True if
+        the array reports erased (FSTAT.FBLANK set). Much faster than
+        reading back and comparing every byte in Python."""
+        self._flash_command(0xFFFF, 0xFF, FCMD_BLANK_CHECK)
+        stat = self.read_byte(REG_FSTAT)
+        return bool(stat & FSTAT_FBLANK)
 
     def flash_program_byte(self, addr, value):
         self._flash_command(addr, value, FCMD_BYTE_PROGRAM)
