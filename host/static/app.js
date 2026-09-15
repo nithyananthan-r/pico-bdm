@@ -59,11 +59,31 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !guideModal.hidden) closeGuide();
 });
 
+// Every state-changing request must carry this header. A cross-origin page
+// cannot set it without triggering a CORS preflight this server will not
+// satisfy, so it's what stops a malicious tab from POSTing /api/mass_erase.
+// Must match CSRF_HEADER/CSRF_VALUE in app.py.
+const CSRF_HEADER = "X-Requested-With";
+const CSRF_VALUE = "pico-bdm";
+
 async function api(path, opts) {
-  const res = await fetch(path, opts);
+  const o = Object.assign({}, opts);
+  o.headers = Object.assign({}, o.headers || {}, { [CSRF_HEADER]: CSRF_VALUE });
+  const res = await fetch(path, o);
   const data = await res.json();
   if (!data.ok) throw new Error(data.error || "request failed");
   return data;
+}
+
+// Single numeric parser used by EVERY user-supplied numeric field in this
+// UI: decimal unless explicitly prefixed with 0x. The Memory panel used to
+// try hex first, so "10" meant 0x10 there and decimal 10 everywhere else --
+// a genuinely dangerous inconsistency in a flash programmer.
+function parseNum(s) {
+  const t = String(s).trim();
+  const n = parseInt(t, t.toLowerCase().startsWith("0x") ? 16 : 10);
+  if (Number.isNaN(n)) throw new Error(`"${s}" is not a number`);
+  return n;
 }
 
 function setConnected(connected) {
@@ -72,11 +92,25 @@ function setConnected(connected) {
   $("connect-btn").disabled = connected;
   $("sync-btn").disabled = !connected;
   $("reset-target-btn").disabled = !connected;
-  // scope-run-btn stays disabled regardless of connection state -- capture
-  // currently hangs the Pico, see CONTEXT.md.
+  // Scope is enabled as of 2026-09-12: the old hang (bdc_sample's
+  // fifo_join=PIO.JOIN_RX making put() block forever) was fixed on
+  // 2026-09-11 and has now been run many times against a real Pico and a
+  // real target without a single hang. It is the tool that produced every
+  // finding in CONTEXT.md's 2026-09-12 section.
+  $("scope-run-btn").disabled = !connected;
 }
 
+// The BDCSCR write field defaults to 0x00, and writing that clears CLKSW
+// (bit 3), which breaks the bit timing sync() just calibrated -- with no
+// warning, and no way back except another sync. So the Write button stays
+// disabled until a Read has actually put the live register value in the
+// field at least once.
+let controlHasBeenRead = false;
+
 function setSynced(synced) {
+  // Losing sync (disconnect, reset target) ends the session the BDCSCR
+  // value was read in, so require a fresh Read before Write again.
+  if (!synced) controlHasBeenRead = false;
   $("mem-read-btn").disabled = !synced;
   $("wb-btn").disabled = !synced;
   $("flash-btn").disabled = !synced;
@@ -90,7 +124,7 @@ function setSynced(synced) {
   $("step-btn").disabled = !synced;
   $("tagged-go-btn").disabled = !synced;
   $("control-read-btn").disabled = !synced;
-  $("control-write-btn").disabled = !synced;
+  $("control-write-btn").disabled = !synced || !controlHasBeenRead;
 }
 
 async function refreshPorts() {
@@ -129,11 +163,15 @@ $("connect-btn").addEventListener("click", async () => {
 });
 
 $("disconnect-btn").addEventListener("click", async () => {
-  await api("/api/disconnect", { method: "POST" });
-  setConnected(false);
-  setSynced(false);
-  $("sync-readout").textContent = "not synced";
-  log("disconnected");
+  try {
+    await api("/api/disconnect", { method: "POST" });
+    setConnected(false);
+    setSynced(false);
+    $("sync-readout").textContent = "not synced";
+    log("disconnected");
+  } catch (e) {
+    log(e.message, "err");
+  }
 });
 
 $("sync-btn").addEventListener("click", async () => {
@@ -172,35 +210,37 @@ $("go-btn").addEventListener("click", async () => {
 });
 
 $("mem-read-btn").addEventListener("click", async () => {
-  const addr = $("mem-addr").value;
-  const len = $("mem-len").value;
   try {
+    const addr = parseNum($("mem-addr").value);
+    const len = parseNum($("mem-len").value);
     const data = await api(
-      `/api/read_block?addr=${encodeURIComponent(addr)}&len=${encodeURIComponent(len)}`
+      `/api/read_block?addr=${addr}&len=${len}`
     );
     const bytes = data.hex.match(/../g) || [];
     $("mem-output").textContent = bytes
       .map((b, i) => b.toUpperCase())
       .join(" ");
-    log(`read ${bytes.length} byte(s) from ${addr}`, "ok");
+    log(`read ${bytes.length} byte(s) from 0x${addr.toString(16).toUpperCase()}`, "ok");
   } catch (e) {
     log(e.message, "err");
   }
 });
 
 $("wb-btn").addEventListener("click", async () => {
-  const addr = $("wb-addr").value;
-  const value = $("wb-value").value;
   try {
+    // parseNum, same as every other panel -- see its definition.
+    const addr = parseNum($("wb-addr").value);
+    const value = parseNum($("wb-value").value);
     await api("/api/write_byte", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        addr: parseInt(addr, 16) || parseInt(addr, 0),
-        value: parseInt(value, 16) || parseInt(value, 0),
-      }),
+      body: JSON.stringify({ addr, value }),
     });
-    log(`wrote ${value} to ${addr}`, "ok");
+    log(
+      `wrote 0x${value.toString(16).toUpperCase()} to ` +
+        `0x${addr.toString(16).toUpperCase()}`,
+      "ok"
+    );
   } catch (e) {
     log(e.message, "err");
   }
@@ -234,15 +274,24 @@ $("flash-btn").addEventListener("click", async () => {
   form.append("file", fileInput.files[0]);
   form.append("bus_freq_hz", busFreq);
   form.append("erase_mode", $("erase-mode").value);
-  form.append("verify", $("opt-verify").checked ? "1" : "0");
 
   try {
     log(`programming ${fileInput.files[0].name}...`);
-    const res = await fetch("/api/flash_srec", { method: "POST", body: form });
+    // Raw fetch (FormData sets its own Content-Type boundary), so the CSRF
+    // header has to be added by hand here -- a multipart POST is a CORS
+    // "simple" request and would otherwise be forgeable cross-origin.
+    const res = await fetch("/api/flash_srec", {
+      method: "POST",
+      headers: { [CSRF_HEADER]: CSRF_VALUE },
+      body: form,
+    });
     const data = await res.json();
     if (!data.ok) throw new Error(data.error);
     $("flash-output").textContent = JSON.stringify(data.chunks, null, 2);
-    log(`programmed ${data.total_bytes} bytes across ${data.chunks.length} region(s)`, "ok");
+    if (data.pages_erased) {
+      log(`erased ${data.pages_erased} FLASH page(s) before programming`);
+    }
+    log(`programmed ${data.total_bytes} bytes across ${data.chunks.length} region(s), verified on the Pico`, "ok");
 
     if ($("opt-run-after").checked) {
       await api("/api/go", { method: "POST" });
@@ -254,10 +303,7 @@ $("flash-btn").addEventListener("click", async () => {
 });
 
 // -- Registers & breakpoint ---------------------------------------------
-
-function parseNum(s) {
-  return parseInt(s, s.trim().toLowerCase().startsWith("0x") ? 16 : 10);
-}
+// (parseNum lives near the top of this file -- one parser for every panel.)
 
 $("reg-read-btn").addEventListener("click", async () => {
   const reg = $("reg-select").value;
@@ -273,8 +319,9 @@ $("reg-read-btn").addEventListener("click", async () => {
 
 $("reg-write-btn").addEventListener("click", async () => {
   const reg = $("reg-select").value;
-  const value = parseNum($("reg-value").value);
+  let value;
   try {
+    value = parseNum($("reg-value").value);
     await api("/api/reg", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -297,14 +344,20 @@ $("bkpt-read-btn").addEventListener("click", async () => {
 });
 
 $("bkpt-write-btn").addEventListener("click", async () => {
-  const addr = parseNum($("bkpt-addr").value);
   try {
+    const addr = parseNum($("bkpt-addr").value);
     await api("/api/bkpt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ addr }),
     });
-    log(`BKPT set to 0x${addr.toString(16).toUpperCase()}`, "ok");
+    // The firmware also arms BDCSCR.BKPTEN here -- without that the BKPT
+    // register has no effect at all on HCS08.
+    log(
+      `BKPT set to 0x${addr.toString(16).toUpperCase()} and armed ` +
+        `(BKPTEN=1, force mode) — resume with Go to run until it's hit`,
+      "ok"
+    );
   } catch (e) {
     log(e.message, "err");
   }
@@ -322,7 +375,10 @@ $("step-btn").addEventListener("click", async () => {
 $("tagged-go-btn").addEventListener("click", async () => {
   try {
     await api("/api/tagged_go", { method: "POST" });
-    log("resumed with breakpoint tagging armed (TAGGO)", "ok");
+    // HCS08 has no external tag-input pin (HCS08RMv1 §7.3.4.16), so TAGGO
+    // is functionally identical to a plain GO here. Say so rather than
+    // implying it does something Go doesn't.
+    log("target resumed (TAGGO — identical to GO on HCS08)", "ok");
   } catch (e) {
     log(e.message, "err");
   }
@@ -332,6 +388,11 @@ $("control-read-btn").addEventListener("click", async () => {
   try {
     const data = await api("/api/control");
     $("control-value").value = "0x" + data.value.toString(16).toUpperCase().padStart(2, "0");
+    controlHasBeenRead = true;
+    $("control-write-btn").disabled = false;
+    $("control-write-btn").title =
+      "write BDCSCR directly — careful: clearing CLKSW (bit 3) breaks the " +
+      "bit timing calibrated by Sync";
     log(`BDCSCR = 0x${data.value.toString(16).toUpperCase()}`, "ok");
   } catch (e) {
     log(e.message, "err");
@@ -339,8 +400,8 @@ $("control-read-btn").addEventListener("click", async () => {
 });
 
 $("control-write-btn").addEventListener("click", async () => {
-  const value = parseNum($("control-value").value);
   try {
+    const value = parseNum($("control-value").value);
     await api("/api/control", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -360,6 +421,16 @@ $("scope-test").addEventListener("change", () => {
   $("scope-bit").style.display = showBit ? "" : "none";
 });
 
+// Read a theme colour from the active CSS custom properties rather than
+// hardcoding it -- the canvas used to be painted in Amber Bench colours
+// whatever theme was selected, which looked broken on Paper (light).
+function themeColor(name, fallback) {
+  const v = getComputedStyle(document.documentElement)
+    .getPropertyValue(name)
+    .trim();
+  return v || fallback;
+}
+
 function drawWaveform(samples, samplePeriodNs) {
   const canvas = $("scope-canvas");
   const ctx = canvas.getContext("2d");
@@ -367,8 +438,12 @@ function drawWaveform(samples, samplePeriodNs) {
   const H = canvas.height;
   ctx.clearRect(0, 0, W, H);
 
+  const gridColor = themeColor("--panel-border", "#1c212a");
+  const traceColor = themeColor("--accent", "#e8a33d");
+  const labelColor = themeColor("--text-dim", "#838d9e");
+
   // grid
-  ctx.strokeStyle = "#1c212a";
+  ctx.strokeStyle = gridColor;
   ctx.lineWidth = 1;
   for (let x = 0; x < W; x += 60) {
     ctx.beginPath();
@@ -385,7 +460,7 @@ function drawWaveform(samples, samplePeriodNs) {
   const lowY = H - padBottom;
   const stepX = W / samples.length;
 
-  ctx.strokeStyle = "#e8a33d";
+  ctx.strokeStyle = traceColor;
   ctx.lineWidth = 2;
   ctx.beginPath();
   let x = 0;
@@ -405,7 +480,7 @@ function drawWaveform(samples, samplePeriodNs) {
   ctx.stroke();
 
   // level labels
-  ctx.fillStyle = "#838d9e";
+  ctx.fillStyle = labelColor;
   ctx.font = "11px JetBrains Mono, monospace";
   ctx.fillText("1", 4, highY + 4);
   ctx.fillText("0", 4, lowY + 4);
@@ -442,4 +517,27 @@ $("log-clear-btn").addEventListener("click", () => {
   logEl.innerHTML = "";
 });
 
-refreshPorts().catch((e) => log(e.message, "err"));
+// -- init ------------------------------------------------------------------
+// The server can still be holding the serial port open from before a page
+// refresh. Ask it rather than assuming "disconnected", which used to make
+// the first Connect click fail and only the second one work.
+//
+// Note: "synced" is NOT recoverable this way -- the server doesn't track it
+// separately from the connection -- so a sync is still required after a
+// reload, exactly as before.
+async function init() {
+  await refreshPorts().catch((e) => log(e.message, "err"));
+  try {
+    const status = await api("/api/status");
+    if (status.connected) {
+      setConnected(true);
+      log("server still has the serial port open — sync target to continue");
+    } else {
+      setConnected(false);
+    }
+  } catch (e) {
+    log(e.message, "err");
+  }
+}
+
+init();

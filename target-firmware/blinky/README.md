@@ -29,13 +29,17 @@ this produces — it doesn't compile anything).
 
 ## Before you trust it beyond blinking
 
-- The `SOPT1` watchdog-disable line in [main.c](main.c) is flagged
-  in-code as unverified against your exact chip's reset bit layout --
-  cross-check against the SG8/SG4 datasheet's SOPT1 register description
-  before relying on it for anything beyond this bring-up test.
+- The `SOPT1 = 0x00` watchdog-disable line in [main.c](main.c) is
+  **confirmed correct** against the MC9S08SG8 datasheet §5.7.3 (checked
+  2026-09-11): on this family the COP is controlled by a two-bit `COPT`
+  field at SOPT1[7:6] that resets to 1:1 (so SOPT1 resets to 0xC0), and
+  there is no `COPE`, `BKGDPE` or `RSTPE` bit in the register — so writing
+  0x00 disables the COP with no risk of also disabling BDM access. The
+  earlier "unverified, check the datasheet" caveat here and in the source
+  has been removed.
 - Adjust `PTADD_PTADD0`/`PTAD_PTAD0` to whichever pin you actually have
   something (LED, scope probe) wired to -- PTA0 was picked as a generic
   example, not because it matches your board.
-- Flash it with **Erase mode: touched pages**, **Verify after write**
-  checked (both are already the pico-bdm UI defaults) so a bad write
-  fails loudly instead of silently.
+- Flash it with **Erase mode: touched pages** (the pico-bdm UI default).
+  Every region is read back and verified on the Pico before programming
+  reports success, so a bad write fails loudly instead of silently.

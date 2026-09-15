@@ -81,13 +81,29 @@ html, body {
   overflow: hidden;
 }
 
+/* body is a flex COLUMN so .bench can simply take "whatever is left below
+   the header" (flex: 1). It used to be calc(100vh - 53px), i.e. the
+   header's height hardcoded -- but that height depends on the Inter /
+   JetBrains Mono webfonts from Google Fonts, and on an offline bench (the
+   realistic setup for this tool) those never load, the fallback font
+   metrics differ, and 53px becomes wrong, clipping the layout or leaving
+   a gap. Nothing here should know the header's height. */
+body {
+  display: flex;
+  flex-direction: column;
+}
+
 .bench-header {
   border-bottom: 1px solid var(--panel-border);
   padding: 12px 24px;
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex: 0 0 auto;
 }
+
+/* (The guide modal is position:fixed, so it is already out of the body's
+   flex flow and needs no flex sizing of its own.) */
 
 .bench-title {
   display: flex;
@@ -119,8 +135,14 @@ html, body {
 .dot.working { background: var(--accent); }
 
 .bench {
+  width: 100%;
   max-width: 1180px;
-  height: calc(100vh - 53px);
+  /* flex item of the body column: take exactly the space left under the
+     header, whatever height the header actually renders at. min-height: 0
+     is what lets it shrink below its content so the compact view fits one
+     screen without scrolling. */
+  flex: 1 1 auto;
+  min-height: 0;
   margin: 0 auto;
   padding: 16px 20px;
   display: grid;
@@ -134,9 +156,11 @@ html, body {
 
 /* Advanced mode has more content than always fits one screen -- let the
    whole page scroll to reach it instead of hiding content inside small
-   per-module scroll boxes (default compact view still needs no scroll). */
+   per-module scroll boxes (default compact view still needs no scroll).
+   flex-shrink: 0 (vs. 1 above) lets .bench keep its full content height
+   and overflow the body, which is what makes the body scroll. */
 body.advanced-scroll { overflow-y: auto; }
-body.advanced-scroll .bench { height: auto; min-height: calc(100vh - 53px); }
+body.advanced-scroll .bench { flex: 1 0 auto; }
 
 .bench.show-advanced {
   grid-template-rows: auto 1fr auto 1fr;

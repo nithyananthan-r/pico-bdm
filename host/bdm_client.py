@@ -3,6 +3,7 @@ bdm_client.py — thin Python client for talking to the Pico firmware's
 newline-delimited JSON serial protocol.
 """
 
+import contextlib
 import json
 import threading
 import base64
@@ -17,23 +18,63 @@ class BdmClientError(Exception):
 class BdmClient:
     def __init__(self):
         self._ser = None
-        self._lock = threading.Lock()
+        # RLock, not Lock: transaction() takes it for a whole multi-command
+        # sequence and every _call() inside that sequence takes it again.
+        self._lock = threading.RLock()
 
     @staticmethod
     def list_ports():
         return [p.device for p in serial.tools.list_ports.comports()]
 
     def connect(self, port, baud=115200, timeout=5):
-        self._ser = serial.Serial(port, baudrate=baud, timeout=timeout)
+        """Open `port`. A failed open leaves any EXISTING connection alone
+        and self._ser untouched -- the old code assigned the result of
+        serial.Serial() directly, so a failure mid-open could leave stale
+        state behind and the caller's error handler would then close a
+        connection that was still perfectly good."""
+        with self._lock:
+            new_ser = serial.Serial(port, baudrate=baud, timeout=timeout)
+            # Only swap in once the open actually succeeded.
+            old = self._ser
+            self._ser = new_ser
+            if old is not None and old is not new_ser:
+                try:
+                    old.close()
+                except Exception:
+                    pass
 
     def disconnect(self):
-        if self._ser:
-            self._ser.close()
-            self._ser = None
+        # Guarded by the lock so it can't race a concurrent _call() and
+        # turn self._ser into None mid-transaction (which surfaced as an
+        # AttributeError -> Flask 500).
+        with self._lock:
+            if self._ser:
+                try:
+                    self._ser.close()
+                finally:
+                    self._ser = None
 
     @property
     def is_connected(self):
         return self._ser is not None and self._ser.is_open
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Hold the serial lock across a whole logical operation.
+
+        _call() locks one JSON round-trip at a time, which is not enough
+        for anything the target treats as a sequence -- a FLASH command is
+        three consecutive register writes, and another browser tab poking
+        /api/read_byte in between is exactly how you get a FACCERR (which,
+        per the datasheet, then blocks every later FLASH command).
+
+        Usage:
+            with client.transaction():
+                client.flash_init_clock(...)
+                client.flash_write(...)
+        """
+        with self._lock:
+            yield self
 
     def _call(self, cmd_dict, timeout=5):
         if not self.is_connected:
@@ -44,10 +85,24 @@ class BdmClient:
             self._ser.write(line.encode())
             resp_line = self._ser.readline()
             if not resp_line:
+                # Flush before raising. If the Pico's answer is merely LATE
+                # rather than absent, leaving it in the input buffer
+                # desynchronises every subsequent call -- each one would
+                # read the *previous* command's response forever after.
+                try:
+                    self._ser.reset_input_buffer()
+                except Exception:
+                    pass
                 raise BdmClientError("timeout waiting for Pico response")
             try:
                 resp = json.loads(resp_line.decode().strip())
             except ValueError:
+                # Same reasoning: a garbled line probably means we're out of
+                # step, so drop whatever else is buffered.
+                try:
+                    self._ser.reset_input_buffer()
+                except Exception:
+                    pass
                 raise BdmClientError("bad response from Pico: %r" % resp_line)
         if not resp.get("ok"):
             raise BdmClientError(resp.get("error", "unknown error"))
@@ -58,10 +113,29 @@ class BdmClient:
         return self._call({"cmd": "ping"})
 
     def hw_reset_to_bdm(self):
-        return self._call({"cmd": "hw_reset_to_bdm"})
+        """Pulse RESET with BKGD held low.
+
+        *** THIS DOES NOT ENTER BDM ON THE MC9S08SG8. *** Datasheet
+        Sec 17.1.1: external-pin and internally-generated resets both
+        IGNORE BKGD; only a power-on reset latches active background mode.
+        Kept because it is a legitimate diagnostic, but
+        power_on_reset_to_bdm() is the entry that works -- see CONTEXT.md
+        Finding 63 and the TENTH session.
+        """
+        return self._call({"cmd": "hw_reset_to_bdm"}, timeout=15)
+
+    def power_on_reset_to_bdm(self):
+        """The real BDM entry on this part: cut VDD (which is on a Pico
+        GPIO), bring it back with RESET and BKGD both held low, then
+        release RESET and BKGD. Takes ~150 ms on the Pico, so the serial
+        timeout has to be generous."""
+        return self._call({"cmd": "power_on_reset_to_bdm"}, timeout=20)
 
     def sync(self):
-        return self._call({"cmd": "sync"}, timeout=10)
+        return self._call({"cmd": "sync"}, timeout=20)
+
+    def set_bit_clock(self, hz):
+        return self._call({"cmd": "set_bit_clock", "hz": int(hz)})["hz"]
 
     def read_byte(self, addr):
         return self._call({"cmd": "read_byte", "addr": addr})["value"]

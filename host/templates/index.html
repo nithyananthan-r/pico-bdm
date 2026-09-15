@@ -41,15 +41,15 @@
       <dt>Connection</dt>
       <dd>Pick your Pico's serial port (Refresh if it's missing) and click Connect. Once connected, click <b>Sync target</b> to measure the target chip's BDC clock — do this before any read, write, or program. <b>Reset target</b> is a plain RESET pulse (target reboots and runs its own code); <b>Go</b> resumes execution from BDM.</dd>
       <dt>Flash</dt>
-      <dd>Set the target's bus clock in Hz and pick an erase mode: erase only the pages you're about to write (default), mass-erase the whole chip first, or skip erasing entirely. Choose a compiled <code>.s19</code>/<code>.srec</code> file and click Program. <b>Verify after write</b> reads each region back and confirms it matches. <b>Run target after programming</b> resumes the target's own code once flashing finishes. <b>Blank check</b> asks the FLASH module itself whether the chip is erased. The standalone <b>Mass erase</b> button wipes the whole chip's FLASH on its own — irreversible, used rarely.</dd>
+      <dd>Set the target's bus clock in Hz and pick an erase mode: erase only the pages you're about to write (default), mass-erase the whole chip first, or skip erasing entirely. In "touched pages" mode every page the file touches is erased <i>once, up front</i> — never per-region, because two regions of a real <code>.s19</code> routinely share a 512-byte page and erasing per-region would wipe an already-programmed region. Choose a compiled <code>.s19</code>/<code>.srec</code> file and click Program. Every region is read back and verified by the Pico itself before it reports success, so there is no verify option to turn off. <b>Run target after programming</b> resumes the target's own code once flashing finishes. <b>Blank check</b> asks the FLASH module itself whether the chip is erased. The standalone <b>Mass erase</b> button wipes the whole chip's FLASH on its own — irreversible, used rarely.</dd>
       <dt>Memory <span class="hint">(under "Show advanced")</span></dt>
       <dd>Read or write a single byte/block at a given address once synced — useful for peeking at registers or poking test values by hand.</dd>
       <dt>Registers &amp; breakpoint <span class="hint">(under "Show advanced")</span></dt>
-      <dd>Read/write the CPU's A, CCR, PC, H:X and SP registers directly. Set a hardware breakpoint address (BKPT) and use <b>Tagged GO</b> to run until it's hit, or <b>Step</b> to single-step one instruction at a time. <b>BDCSCR</b> is the BDC's own status/control register — writing it can clear sticky flags or change the clock-switch bit.</dd>
+      <dd>Read/write the CPU's A, CCR, PC, H:X and SP registers directly. <b>Set BKPT</b> writes the BDC breakpoint address <i>and arms it</i> (BDCSCR.BKPTEN=1, force mode) — arming matters, because BDCSCR resets with BKPTEN=0 and the breakpoint register does nothing at all while it's clear. Once armed, resume with <b>Go</b> and the target halts back into BDM when it reaches that address. <b>Tagged GO</b> is <i>not</i> a "run to breakpoint" button: HCS08 parts have no external tag-input pin (HCS08RMv1 §7.3.4.16), so TAGGO behaves exactly like a plain GO here — it's exposed only for completeness. <b>Step</b> single-steps one instruction (TRACE1). <b>BDCSCR</b> is the BDC's own status/control register; Read it first (Write stays disabled until you have, because writing the default 0x00 would clear CLKSW and break the bit timing Sync just calibrated).</dd>
       <dt>Scope <span class="hint">(under "Show advanced")</span></dt>
-      <dd>Self-capture diagnostic panel that draws the actual BKGD waveform without needing a separate logic analyzer. <b>Currently disabled</b> — it hangs the Pico and needs a hardware-level fix; see CONTEXT.md.</dd>
+      <dd>Self-capture diagnostic panel that draws the actual BKGD waveform without needing a separate logic analyzer. A second, passive PIO state machine watches the line while the selected operation runs, triggered by the line's first falling edge so Python's imprecise call timing doesn't matter. Enabled and proven on real hardware as of 2026-09-12 — it is what found the protocol bugs recorded in CONTEXT.md. Note that the same Pico both drives and records, so it cannot catch a fault in its own clock; and only the first 128 samples of a fast capture are guaranteed contiguous in time (the PIO RX FIFO is 4 words deep). The raw <code>capture</code> serial command also accepts <code>window_us</code> to zoom out to a whole transaction, and a <code>"command"</code> test to capture an arbitrary BDC command — both well worth using directly, see README.</dd>
       <dt>Options</dt>
-      <dd>Log display preferences (auto-scroll, timestamps) and the sample count Scope will use once it's re-enabled. Erase/verify/run-after-program options live directly in the Flash panel.</dd>
+      <dd>Log display preferences (auto-scroll, timestamps) and the sample count Scope will use once it's re-enabled. Erase and run-after-program options live directly in the Flash panel.</dd>
       <dt>Log</dt>
       <dd>Running history of every command sent and its result, newest at the bottom. Clear wipes it.</dd>
     </dl>
@@ -89,10 +89,9 @@
       </select>
     </div>
     <div class="row checkbox-row">
-      <input type="checkbox" id="opt-verify" checked>
-      <label for="opt-verify">Verify after write</label>
       <input type="checkbox" id="opt-run-after">
       <label for="opt-run-after">Run target after programming</label>
+      <span class="hint">every region is read back and verified on the Pico</span>
     </div>
     <div class="row">
       <input type="file" id="srec-file" accept=".s19,.s28,.s37,.srec">
@@ -127,21 +126,18 @@
   <section class="module" id="module-scope">
     <h2>Scope <span class="hint">(self-capture — no logic analyzer needed)</span></h2>
     <div class="row">
-      <span class="warn">⚠ disabled: capture currently hangs the Pico (needs a hardware fix) — see CONTEXT.md</span>
-    </div>
-    <div class="row">
       <label>test</label>
       <select id="scope-test" class="mono">
         <option value="sync">SYNC pulse</option>
-        <option value="write_bit">write bit</option>
-        <option value="read_bit">read bit</option>
+        <option value="write_bit">write byte</option>
+        <option value="read_bit">read byte</option>
       </select>
       <label id="scope-bit-label" style="display:none">bit</label>
       <select id="scope-bit" class="mono" style="display:none">
         <option value="1">1</option>
         <option value="0">0</option>
       </select>
-      <button id="scope-run-btn" disabled title="disabled: capture currently hangs the Pico, see CONTEXT.md">Capture</button>
+      <button id="scope-run-btn" disabled title="record the actual BKGD waveform while the selected operation runs">Capture</button>
     </div>
     <canvas id="scope-canvas" width="900" height="140"></canvas>
     <div class="readout" id="scope-readout">—</div>
@@ -167,15 +163,15 @@
       <label>breakpoint addr</label>
       <input type="text" id="bkpt-addr" value="0x0000" class="mono">
       <button id="bkpt-read-btn" disabled>Read BKPT</button>
-      <button id="bkpt-write-btn" disabled>Set BKPT</button>
+      <button id="bkpt-write-btn" disabled title="set the BDC breakpoint address AND arm it (BDCSCR.BKPTEN=1, force mode) — then use Go to run until it is reached">Set BKPT</button>
       <button id="step-btn" disabled title="single-step one instruction (TRACE1)">Step</button>
-      <button id="tagged-go-btn" disabled title="resume with breakpoint tagging armed (TAGGO)">Tagged GO</button>
+      <button id="tagged-go-btn" disabled title="TAGGO — HCS08 has no external tag-input pin, so this behaves identically to a plain Go; use Set BKPT + Go to stop at an address">Tagged GO</button>
     </div>
     <div class="row">
       <label>BDCSCR</label>
       <input type="text" id="control-value" value="0x00" class="mono" style="width:5em">
       <button id="control-read-btn" disabled>Read</button>
-      <button id="control-write-btn" disabled title="write BDCSCR directly — clears sticky WS/WSF/DVF flags, sets CLKSW, etc.">Write</button>
+      <button id="control-write-btn" disabled title="Read BDCSCR first — writing the placeholder 0x00 would clear CLKSW (bit 3) and break the bit timing Sync calibrated">Write</button>
     </div>
   </section>
 
