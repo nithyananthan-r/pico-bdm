@@ -491,9 +491,12 @@ function buildMemMap() {
   legend.innerHTML = "";
   [
     ["rg-reg", "registers"], ["rg-ram", "RAM"], ["rg-flash", "FLASH"],
-    ["rg-nvm", "NVM option / backdoor key"], ["rg-vector", "vector table"],
-    ["bad", "defective cell (measured)"], ["blank", "blank 0xFF (scanned)"],
-    ["written", "just programmed"],
+    ["rg-nvm scanned", "NVM option / backdoor key $FFB0–$FFBF"],
+    ["rg-vector scanned", "vector table $FFC0–$FFFF"],
+    ["scanned blank", "blank 0xFF (read back)"],
+    ["scanned zero", "all 0x00 (read back)"],
+    ["bad", "defective cell (measured on this die)"],
+    ["written", "programmed in this run"],
   ].forEach(([cls, text]) => {
     const s = el("span");
     const i = el("i", "mc " + cls);
@@ -616,6 +619,15 @@ function applyScan(key) {
 
 function applyAllScans() {
   Object.keys(scanned).forEach(applyScan);
+}
+
+// Anything that changes the chip out from under a previous read has to
+// throw that read away. Leaving stale bytes coloured in is the same class
+// of lie as animating registers on a running target.
+function discardScans(why) {
+  Object.keys(scanned).forEach((k) => delete scanned[k]);
+  buildMemMap();
+  $("memmap-status").textContent = why + " — press Scan to read the chip back";
 }
 
 async function scanRange(key, start, len) {
@@ -1419,6 +1431,7 @@ $("mass-erase-btn").addEventListener("click", () => {
       await jsonPost("/api/mass_erase");
       log("mass erase complete", "ok");
       await readSecurity(true);
+      discardScans("FLASH was mass-erased — the previous read is stale");
       return { ok: true, text: "Mass erase complete." };
     },
   });
@@ -1556,12 +1569,11 @@ $("sec-wipe-btn").addEventListener("click", () => {
           : `Backup NOT taken: ${b.reason}`);
       log(text.replace(/\n/g, " | "), d.complete ? "ok" : "err");
       showSecResult(text, d.complete);
-      // The array is blank now; say so in the map rather than leaving the
-      // old scan on screen implying content that no longer exists.
-      delete scanned.flash;
-      buildMemMap();
-      $("memmap-status").textContent =
-        "chip was wiped — previous scan discarded, press Scan to read it back";
+      // Every previous read is now stale: FLASH was erased, and the part
+      // was power-cycled around the sequence, so RAM is not what it was
+      // either. Drop the whole scan rather than leaving old bytes on
+      // screen looking current.
+      discardScans("chip was wiped — every previous read is stale");
       return { ok: d.complete, text };
     },
   });

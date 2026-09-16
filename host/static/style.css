@@ -618,18 +618,40 @@ button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red)
   border-radius: 1px;
   transition: background 0.18s ease, opacity 0.18s ease, transform 0.18s ease;
 }
+/* Fill = which region. The two special blocks INSIDE flash are marked with
+   a border instead of another fill, so fill stays free to carry content
+   (blank / programmed / all-zero) everywhere. */
 .mc.rg-reg    { background: var(--blue); }
 .mc.rg-ram    { background: var(--violet); }
-.mc.rg-flash  { background: var(--text-dim); }
+.mc.rg-flash  { background: var(--accent); }
 .mc.rg-nvm    { background: var(--accent); }
-.mc.rg-vector { background: var(--blue); }
+.mc.rg-vector { background: var(--accent); }
 
-/* Once scanned, content wins over region type. */
-.mc.blank { background: var(--panel-border); opacity: 0.55; }
-.mc.data  { opacity: 1; }
-.mc.zero  { background: var(--red); opacity: 0.55; }
+/* Once scanned, content modulates the region colour. RED IS RESERVED: it
+   means a defective cell or a failed write, never "this byte happens to be
+   0x00" -- an earlier pass used it for both and the two were impossible to
+   tell apart on the map. */
 .mc.scanned { opacity: 1; }
-.mc.scanned.blank { opacity: 0.5; }
+.mc.scanned.data { opacity: 1; }
+.mc.scanned.blank {
+  background: var(--input-bg);
+  border-color: var(--panel-border);
+  opacity: 0.8;
+}
+.mc.scanned.zero {
+  background: var(--input-bg);
+  border-color: var(--text-dim);
+  border-style: dotted;
+  opacity: 0.9;
+}
+
+/* Which region a cell belongs to must stay visible whatever is currently
+   stored in it, so the NVM option block and the vector table keep their
+   border even when blank. The class is repeated to out-specify the
+   three-class content rules above (.mc.scanned.blank et al) -- ordering
+   alone does not win against higher specificity. */
+.mc.rg-nvm.rg-nvm       { border-color: var(--text); border-style: solid; }
+.mc.rg-vector.rg-vector { border-color: var(--blue); border-style: solid; }
 
 .mc.bad {
   background: var(--red) !important;

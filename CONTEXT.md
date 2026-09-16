@@ -5396,3 +5396,88 @@ $0063, $0064 and $006E still take arbitrary data), but the point stands
 and is now load-bearing in the UI: the memory map marks defective cells
 **only** from a live `defect_scan`, and marks nothing at all until one has
 been run. Finding 92's table is never drawn.
+
+### Finding 112 — a serial error came out of /api/ as an HTML page, and the UI reported "Unexpected token '<'"
+
+Hit for real while integrating. `/api/chip_info` raised
+`serial.SerialException: Cannot configure port ... PermissionError(13)`
+after the Pico's USB CDC went away. Nothing caught it: every route catches
+`BdmClientError`, and `SerialException` subclasses `IOError`/`OSError`.
+The existing `errorhandler(HTTPException)` (added precisely so /api/ always
+answers JSON) does not cover non-HTTP exceptions, so Flask rendered the
+Werkzeug debugger's HTML page, `app.js`'s `res.json()` choked on it, and the
+UI's error message was **"Unexpected token '<'"** — which says nothing at
+all about a dropped USB device.
+
+Fixed with an `errorhandler(Exception)` that, for `/api/` paths only,
+prints the traceback to the console (where a bench user wants it) and
+returns `{"ok":false,"error":"..."}` with 500. An `OSError` additionally
+gets the sentence that actually helps: *the serial handle is no longer
+usable, the port most likely re-enumerated, Disconnect and Connect again*.
+
+### Finding 113 — the UI, measured against real hardware
+
+Everything below was exercised in a browser against the real MC9S08SG8 on
+COM10, not asserted from the code:
+
+- **Connect → Sync → identify.** Sync through the UI measured 9.249 MHz,
+  auto-filled the bus-clock field, and the Chip panel filled itself in:
+  MC9S08SG8, confidence "probed", SDIDL 0x14 ✓, FOPT 0xC2 / NVOPT 0xFE
+  unsecured, reset source LVD+POR, blank check "programmed".
+- **Deep probe.** 13 of the 16 cells in $0060–$006F reported defective and
+  drawn in red on the map, at the right addresses ($0063, $0064, $006E
+  still clean). Nothing is drawn there until a scan has run.
+- **Live polling, both honesty rules.** Halted: PC 0xE07B, CCR 0x68,
+  SP 0x00FF, A 0x00 — shown as values. After GO: BDCSCR 0x89, the pill
+  flips to RUNNING, and all five registers render as "unavailable / target
+  is running" in dashed boxes with the backend's own reason as the
+  tooltip. PTA0 tracked the blinky live. A `link_ok:false` snapshot blanks
+  the register grid, marks every pin stale, shows BDCSCR as "(no answer)"
+  rather than 0xFF, and raises the LINK LOST banner with a Relink button.
+- **Halt.** `/api/halt` stopped the running blinky and BDCSCR read back
+  0xC8.
+- **Real-time programming.** Project.abs.s19 through the UI, sampling the
+  DOM every 100 ms during the run:
+
+```
+  +349ms  64 cells queued (both pages planned)
+  +628ms  row $E000 in flight, 12 cells pulsing   (192 B / 16 B per cell)
+  +1429ms still $E000            <- ~950 ms of real page programming
+  +1576ms $E000 CONFIRMED (12 written), $FE00 now in flight (1 cell)
+  +1744ms both confirmed, 13 cells written, "194 bytes ... 1.3 s"
+```
+
+  The dwell times are the hardware's, not a timer's: page $E000 (192 bytes)
+  held for ~950 ms and page $FE00 (2 bytes) for ~170 ms, in the ratio the
+  byte counts predict.
+
+- The target was left with the blinky programmed and every page verified,
+  unsecured (FOPT 0xC2, NVOPT 0xFE).
+
+### Finding 114 — the Pico left the USB bus mid-session; what that means for what is and is not verified
+
+After the programming test above, COM10 disappeared from Windows entirely
+(`SerialPort::getportnames()` lists COM1 only; the device shows in PnP with
+status "Unknown", i.e. an offline ghost). It did not come back over ~20
+minutes of polling. This is a physical replug, not something software can
+do from here.
+
+So these UI paths are verified against **recorded** backend payloads (the
+exact shapes in `app.py`'s docstrings and the measured outputs in the
+ELEVENTH session) rather than against the chip, in a throwaway harness that
+overrode `window.fetch` and was deleted afterwards:
+
+- Verify (match and mismatch), Dump/backup, whole-chip scan into the map
+  (1216 cells, all classified)
+- The lock flow (typed "SECURE", confirm gated on the exact word) and the
+  wipe flow (typed "WIPE", the seven-step checklist rendering the real
+  step reports)
+- The programming FAILURE path, which is the one this file cares most
+  about: it names the failing page, lists the pages confirmed good before
+  it, and colours them differently on the map —
+  `FAILED at page $FE00. 1 page(s) before it are confirmed erased,
+  programmed and verified: $E000.`
+
+The lock → unsecure cycle has **not** been re-run against the chip this
+session; the ELEVENTH session's Finding 105 is still the hardware evidence
+for it. Re-plug the Pico and the whole flow is one Connect away.
