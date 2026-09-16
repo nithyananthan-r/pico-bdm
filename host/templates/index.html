@@ -10,12 +10,20 @@
 </head>
 <body>
 
+<!-- Header = GLOBAL and PERSISTENT only: who this is (brand + link state),
+     where you can go (Features), and session-wide settings (theme, help).
+     Anything that is part of doing a job lives in a panel in the body. Three
+     zones, rule-separated, rather than controls appended left to right as
+     they were added. -->
 <header class="bench-header">
-  <div class="bench-title">
-    <span class="dot" id="conn-dot"></span>
+  <div class="hdr-brand">
+    <span class="dot" id="conn-dot" title="serial link to the programmer"></span>
     <h1>pico-bdm</h1>
     <span class="subtitle">background debug controller — S08/RS08</span>
   </div>
+
+  <span class="hdr-rule" aria-hidden="true"></span>
+
   <nav class="bench-nav">
     <div class="menu-wrap">
       <button id="features-btn" class="nav-btn" type="button"
@@ -25,17 +33,25 @@
       <div id="features-menu" class="menu" role="menu" hidden></div>
     </div>
   </nav>
-  <div class="bench-header-right">
-    <span class="readout" id="header-chip">—</span>
-    <button id="guide-btn" class="info-btn" type="button" aria-label="how to use this page">i</button>
-    <label for="theme-select" class="hint">theme</label>
-    <select id="theme-select" class="theme-select">
+
+  <div class="hdr-spacer"></div>
+
+  <div class="hdr-status">
+    <span class="hdr-chip" id="header-chip"></span>
+    <span class="hdr-link off" id="header-link">not connected</span>
+  </div>
+
+  <span class="hdr-rule" aria-hidden="true"></span>
+
+  <div class="hdr-tools">
+    <select id="theme-select" class="theme-select" aria-label="colour theme">
       <option value="amber">Amber Bench</option>
       <option value="terminal">Terminal Green</option>
       <option value="nord">Nord</option>
       <option value="dracula">Dracula</option>
       <option value="paper">Paper (light)</option>
     </select>
+    <button id="guide-btn" class="info-btn" type="button" aria-label="how to use this page">?</button>
   </div>
 </header>
 
@@ -111,8 +127,20 @@
 
 <main class="bench">
 
+  <!-- CORE: the connect-and-flash path, three numbered steps left to right.
+       This is the only thing that is always on the page. -->
+  <section class="bench-section" id="section-workflow">
+    <div class="section-head">
+      <span class="eyebrow">Workflow</span>
+      <h2>Connect &rarr; identify &rarr; program</h2>
+      <span class="section-note">Everything else &mdash; live debugger, package pins,
+        memory map, security, verify/dump and the raw tools &mdash; opens from
+        <b>Features</b> above.</span>
+    </div>
+    <div class="workflow-grid">
+
   <section class="module" id="module-connect">
-    <h2>Connection</h2>
+    <h2><span class="h2-title"><span class="step">1</span>Connection</span></h2>
     <div class="row">
       <select id="port-select"></select>
       <button id="refresh-ports">Refresh</button>
@@ -132,7 +160,7 @@
   </section>
 
   <section class="module" id="module-chip">
-    <h2>Chip <span class="hint">identified from the socket, not assumed</span></h2>
+    <h2><span class="h2-title"><span class="step">2</span>Chip</span><span class="hint">identified from the socket, not assumed</span></h2>
     <div class="chip-hero">
       <div class="chip-name" id="chip-name">—</div>
       <div class="chip-sub" id="chip-sub">connect and sync to identify the part</div>
@@ -148,7 +176,7 @@
   </section>
 
   <section class="module" id="module-flash">
-    <h2>Program <span class="hint">page at a time — erase → program → verify</span></h2>
+    <h2><span class="h2-title"><span class="step">3</span>Program</span><span class="hint">page at a time — erase → program → verify</span></h2>
     <div class="row">
       <label>bus clock (Hz)</label>
       <input type="text" id="bus-freq" value="8000000" class="mono">
@@ -179,9 +207,22 @@
     <pre class="hexdump mono" id="flash-output">—</pre>
   </section>
 
-  <section class="module" id="module-log">
-    <h2>Log <button id="log-clear-btn" class="link-btn">Clear</button></h2>
-    <pre class="log mono" id="log"></pre>
+    </div>
+  </section>
+
+  <!-- OUTPUT: not a step, so it is deliberately quieter -- no accent rule,
+       separated from the workflow block above. -->
+  <section class="bench-section subdued" id="section-output">
+    <div class="section-head">
+      <span class="eyebrow">Output</span>
+      <h2>Log</h2>
+      <span class="section-note">Every command sent and what actually came back,
+        newest at the bottom.</span>
+      <button id="log-clear-btn" class="link-btn">Clear</button>
+    </div>
+    <section class="module subdued" id="module-log">
+      <pre class="log mono" id="log"></pre>
+    </section>
   </section>
 
 </main>

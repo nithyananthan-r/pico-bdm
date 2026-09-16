@@ -58,7 +58,9 @@ Consequences for anyone reading values out of this driver:
 
 import time
 from machine import Pin, mem32
+from rp2 import StateMachine
 from bdc_pio import (
+    bdc_sample,
     bdc_tx_byte,
     bdc_sync,
     make_state_machine,
@@ -73,6 +75,7 @@ from bdc_pio import (
     SET_PINDIRS_IN,
     SM_RAW,
     SM_TX,
+    SM_CAPTURE,
 )
 
 # ---------------------------------------------------------------------------
@@ -1267,7 +1270,25 @@ class Bdc:
         cap_freq = int(sample_count * CYCLES_PER_SAMPLE * 1e6 / window_us)
         cap_freq = int(min(max(cap_freq, SM_MIN_FREQ_HZ), SM_MAX_FREQ_HZ))
 
-        cap_sm = make_capture_state_machine(pin_num, cap_freq)
+        # NOT make_capture_state_machine(): that one constructs
+        # Pin(n, Pin.IN), which RE-INITIALISES the pad and steals the GPIO's
+        # function select back to SIO. On BKGD, where the caller is about to
+        # drive the pin from PIO anyway, that is harmless. On an arbitrary
+        # pin it is Finding 24 all over again -- measured here: with
+        # Pin(16, Pin.IN) in the path, a hardware PWM running on GP16 was
+        # silently switched off the instant the capture armed, and every
+        # capture came back "never triggered".
+        #
+        # RP2040 PIO *inputs* are not gated by function select at all, so
+        # reading the pin needs no pad reconfiguration. Pin(n) with no mode
+        # argument (the same choice make_capture2_state_machine documents)
+        # leaves whatever is driving the pin alone. apply_pad() is still
+        # called: it only touches pull/drive/input-enable, never funcsel, and
+        # the pull-up it sets gives a probe wire a defined idle level without
+        # overriding anything that is actually driving.
+        p = Pin(pin_num)
+        apply_pad(pin_num)
+        cap_sm = StateMachine(SM_CAPTURE, bdc_sample, freq=cap_freq, in_base=p)
         if pin_num == self.bkgd_pin_num:
             # Same rule as _capture(): constructing the capture SM on BKGD
             # takes that pin's function select away from the cached tx/rx

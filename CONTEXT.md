@@ -5481,3 +5481,245 @@ overrode `window.fetch` and was deleted afterwards:
 The lock → unsecure cycle has **not** been re-run against the chip this
 session; the ELEVENTH session's Finding 105 is still the hardware evidence
 for it. Re-plug the Pico and the whole flow is one Connect away.
+
+## THIRTEENTH session (2026-09-16) — the page as a page, and the pins as pins
+
+Two asks, both about the UI having outgrown itself: hide the panels that
+made the page long behind a nav menu, and draw the chip as a chip with its
+pins live. Plus a header/hierarchy pass and a Log-panel fix folded in at the
+user's request mid-session.
+
+**The Pico came back.** COM10 re-enumerated on its own between the TWELFTH
+session and this one (Finding 114's open item), so everything below was
+exercised against the real MC9S08SG8 unless it says otherwise.
+
+### Finding 115 — moving panels beats duplicating them, and hiding a heading hid its buttons
+
+The page had grown to eight stacked panels plus a "Show advanced" toggle
+that revealed four more. The default view is now four panels — Connection,
+Chip, Program, Log — and the other nine open from a **Features** menu in the
+header as a right-hand slide-over (Esc / x / click-outside; alt+1…9).
+
+The implementation choice that made this cheap: a panel is **moved**, not
+duplicated. The single `<section>` lives in a hidden `#feature-stash` and is
+`appendChild`-ed into the drawer on open and returned on close. Elements keep
+their identity, so every `getElementById` handle, every listener and every
+scrap of live state (a half-scanned memory map, a rendered waveform) survives
+open/close with no re-wiring. Verified in the browser: all nine open, render
+with real height, and all nine return to the stash on close, with zero
+console errors.
+
+Two things this forced, both load-bearing:
+
+- **Nothing may gate on visibility.** `startPolling` owns a global timer and
+  `watchProgress` owns its own; neither knows a panel exists. Confirmed by
+  opening and closing panels with polling running — no duplicated interval,
+  no stopped one.
+- **A hidden heading takes its controls with it.** The first cut styled
+  `.drawer-body .module > h2:first-child { display: none }` to avoid
+  repeating the panel title next to the drawer's own. That removed **Start
+  polling**, **Scan chip / Scan RAM only** and **Clear** from the screen —
+  those live *inside* their panel's `<h2>`. Caught by clicking Start polling
+  and finding no button. The rule is gone; the h2 stays.
+
+The old "Show advanced" toggle was **removed rather than kept alongside**.
+Two mechanisms for "show me a panel" is one too many, and the toggle's four
+panels are simply the menu's "Advanced" group now.
+
+Real-time programming was the one thing the reorganisation could plausibly
+break, since the map is no longer on the page. Starting a live run now
+auto-opens the Memory map and **moves the `#flash-progress` block next to
+it** (same move-don't-duplicate trick, so the bar, status line and page list
+are the same elements `finishFlash()` writes to either way). Closing the
+drawer returns it to the Program panel.
+
+Measured, programming page $E000 back onto the running target through the
+new UI:
+
+```
+  drawer auto-opened, title "Memory map"
+  #flash-progress parent -> module-memmap        (during the run)
+  $E000  189 B - erased - programmed 189 - VERIFIED
+  status "complete — 189 bytes across 1 page(s), every page verified · 1.2 s"
+  12 map cells .written, row $E000 .page-done
+  Esc -> #flash-progress parent back to module-flash, status text intact
+  /api/verify against the same file: match, 189 bytes, 0 mismatches
+```
+
+### Finding 116 — the 20-TSSOP pinout, re-read rather than inherited
+
+Drawn from the MC9S08SG8 MCU Series Data Sheet Rev. 8, **Table 2-1 "Pin
+Availability by Package Pin-Count"** (p.31), 20-pin column, read out of the
+data sheet for this panel rather than copied from a previous note:
+
+```
+ 1 RESET                    11 PTC1  TPM1CH1 / PTC0 / ADP9
+ 2 BKGD  MS                 12 PTC0  TPM1CH0 / PTC0 / ADP8
+ 3 VDD                      13 PTB3  PIB3 / MOSI / PTC0 / ADP7
+ 4 VSS                      14 PTB2  PIB2 / SPSCK / PTC0 / ADP6
+ 5 PTB7  SCL1 / EXTAL       15 PTB1  PIB1 / TxD / ADP5
+ 6 PTB6  SDA1 / XTAL        16 PTB0  PIB0 / RxD / ADP4
+ 7 PTB5  TPM1CH1/SS/PTC0    17 PTA3  PIA3 / SCL1 / ADP3
+ 8 PTB4  TPM2CH1/MISO/PTC0  18 PTA2  PIA2 / SDA1 / ADP2 / ACMPO
+ 9 PTC3  PTC0 / ADP11       19 PTA1  PIA1 / TPM2CH0 / ADP1 / ACMP-
+10 PTC2  PTC0 / ADP10       20 PTA0  PIA0 / TPM1CH0 / TCLK / ADP0 / ACMP+
+```
+
+Footnotes that change what the drawing means, and are carried into each
+pin's card rather than dropped: IIC can be repositioned with IICPS in SOPT2
+(reset default is PTA3/PTA2, **not** PTB7/PTB6); TPM1 channels move with
+TPM1PS in SOPT2 (reset default TPM1CH0 = PTA0, TPM1CH1 = PTB5); the "PTC0"
+entries are the ganged-output feature, not a second PTC0; pins 9-12 exist
+only on the 20-pin package.
+
+Pins 1-10 run down the left, 11-20 back up the right — counter-clockwise
+from the dimple, as a real TSSOP is numbered.
+
+Each port pin is lit from the **same `/api/live_state` poll the debugger
+panel uses**. A second poller was the obvious way to build this and is
+exactly wrong: it would double the BDM traffic and could show two different
+answers at the same instant. `renderLiveState()` calls `renderPorts()` and
+`updatePackage()` from one snapshot, and everything that blanks the old pin
+grid (link lost, poll stopped, link busy) blanks the package too.
+
+Measured against the chip, with the blinky:
+
+```
+  halted:   PTB7=1 PTB6=1 (both inputs) lit green-outlined, all others dim
+            -- identical to the debugger panel's own pin row
+  running:  PTA0 solid green FILLED (direction=out, level=1), then dim,
+            then filled again across successive polls -- the blinky tracked
+            live on the package drawing
+  polling off / link lost: every I/O pin goes grey and the panel says
+            "No live reading", rather than freezing the last values on screen
+```
+
+Output pins are drawn filled, input pins hollow, RESET/BKGD violet, VDD/VSS
+blue, no-reading grey — all from CSS variables, checked in the Amber and
+Paper (light) themes.
+
+### Finding 117 — you cannot scope a pin that is not wired, and the UI has to say so
+
+The ask was "if it outputs PWM I need to see it in the visualization if I
+hover that pin". The honest answer starts with the wiring: **this rig has
+three wires to the target** — BKGD (pin 2 to GP15), RESET (pin 1 to GP14)
+and VDD (pin 3 to GP12, driven). No PTA/PTB/PTC pin is electrically
+connected to the Pico. So there is no capture of PTB5's TPM1CH1 output to be
+had, at any sample rate, until somebody puts a wire on it.
+
+So each pin's card states its own wiring, and offers what is actually
+possible:
+
+- RESET / BKGD / VDD: "Physically wired to the programmer on Pico GPnn
+  (confirmed by the Pico)" — the GPIO numbers come from `/api/power`, not
+  from `firmware/main.py`'s constants, and say "firmware default — not
+  confirmed this session" until the Pico answers.
+- Everything else: "NOT wired to the programmer… patch a jumper from this
+  pin to a spare Pico GPIO, enter that GPIO below, and the capture becomes
+  real."
+
+Backing that, two new routes and one new firmware method:
+
+- `POST /api/probe_pin {gpio, ms}` -> the existing firmware `probe_pin`
+  (low duty + edge count on any GPIO), which had never been wired up to the
+  host. **No firmware change.**
+- `POST /api/capture_pin {gpio, sample_count, window_us}` -> new
+  `Bdc.capture_pin()`: the same passive PIO scope as `_capture()`, but
+  watching an arbitrary GPIO with nothing driven by us. **`bdc_pio.py` is
+  untouched** — `bdc_sample` and `make_capture_state_machine` were already
+  pin-parameterised.
+
+### Finding 118 — `Pin(n, Pin.IN)` silently switched off the signal being captured (Finding 24, again)
+
+`capture_pin` did not work on the first hardware run: every capture came
+back `triggered: False`, including against a known-good stimulus.
+
+The cause is Finding 24's hazard in a new place.
+`make_capture_state_machine()` constructs `Pin(pin_num, Pin.IN)`, which
+**re-initialises the pad and pulls the GPIO's function select back to SIO**.
+On BKGD that is harmless — the caller is about to drive that pin from PIO
+anyway. On an arbitrary pin it switches off whatever was driving it. With an
+RP2040 hardware PWM running on GP16, arming the capture killed the PWM
+before it recorded a single edge.
+
+Fix, inside `bdc.py` only: build the capture state machine from `Pin(n)`
+with **no mode argument** — the same choice `make_capture2_state_machine`
+documents — and keep `apply_pad()`, which touches pull/drive/input-enable
+but never funcsel. RP2040 PIO *inputs* are not gated by function select at
+all, so reading the pin needs no pad reconfiguration.
+`make_capture_state_machine` itself is unchanged, so the existing BKGD scope
+path is untouched.
+
+Measured on the Pico afterwards, with hardware PWM on GP16 as an independent
+stimulus (it runs without the CPU, so the capture is recording a signal it
+is not producing — the same relationship a patched target pin would have):
+
+```
+  1 kHz 25%, window 2000 us (7812 ns/sample):  triggered  high 25.0%   3 edges
+  1 kHz 25%, window 4000 us (15625 ns/sample): triggered  high 25.0%   8 edges
+      pattern: 24 low (trigger landed mid-low), 16 high, 48 low, 8 high...
+      -> 16 high + 48 low = 64 samples = 1000 us = 1 kHz, duty 16/64 = 25%
+  4 kHz 75%, window 2000 us:                   triggered  high 75.0%  15 edges
+  GP17, nothing connected:                     NOT triggered, 0 samples
+```
+
+Both duty cycles and both frequencies come back exactly right, and the
+unconnected pin reports no measurement instead of a flat line. Edge counts
+are one short of the naive n x 2 because the trigger arms on a level and so
+starts mid-phase.
+
+Through the HTTP stack and the UI, against idle-high BKGD:
+
+```
+  POST /api/capture_pin {"gpio":15,...} -> {"triggered":false, 0 samples}
+  the card draws the empty grid and says: "NO CAPTURE on GP15. The scope
+  arms on a falling edge and the pin never went low... this is not 'the line
+  was flat'."
+  POST /api/probe_pin {"gpio":15,"ms":30}
+    -> low 0.0% of 1250 samples, 0 transitions -> "No edges: the pin is
+       static (or unconnected)."
+  POST /api/capture_pin {"gpio":99} -> 400 "gpio out of range: 99 (0..28)"
+```
+
+Regression check after the firmware change: the existing BKGD scope still
+captures a real SYNC handshake (256 samples @ 2343 ns, 3 edges), and
+`/api/live_state` still answers with a healthy link.
+
+**Not verified:** a real waveform from an actual MC9S08SG8 port pin. That
+needs a jumper from a target pin to a spare Pico GPIO, which is a physical
+change to the rig nobody has made. The path is proven end-to-end on a real
+external signal; only the S08 as the source is untested.
+
+### Finding 119 — the header and the page were a pile, not a design
+
+Folded in at the user's request. Two changes, no new features.
+
+**Header** now has three zones separated by rules — identity (status dot,
+wordmark, subtitle) | navigation (Features) | *spacer* | live status (part
+name + a link pill) | settings (theme, "?"). The rule that settles what goes
+up there: **global and persistent only**; anything that is part of doing a
+job stays in a panel. The link pill exists because a dropped link is global
+news — it invalidates every panel at once, and the Connection panel may well
+be behind an open slide-over when it happens, so `setLinkState()` writes the
+Connection readout and the pill from one call, and `showLinkLost()` flips the
+pill to a flashing red LINK LOST.
+
+**Body** is two bands of deliberately different weight instead of a flat
+stack: a `WORKFLOW` band (accent eyebrow, "Connect - identify - program",
+three panels numbered 1/2/3 left to right) and a quieter `OUTPUT` band (no
+accent, dim heading) holding the Log. At 1500x900 the whole page fits with
+no scrolling; at 760 px it collapses to one column, drops the subtitle, and
+keeps the header coherent.
+
+**Log panel**: it had min/max heights and still moved the grid around. It
+now has a fixed `--log-height` with its own scroller. Measured: 200 lines
+appended, panel height 339 px before and 339 px after, scroller 298 px over
+2876 px of content, scrolled to the newest line — and the existing
+"Auto-scroll log" option still governs that, rather than a new forced scroll.
+
+### State the target was left in
+
+Programmed with the blinky at $E000 (189 bytes, verified byte-for-byte after
+the test run), **running**, unsecured (FOPT 0xC2 / NVOPT 0xFE), link live at
+9.249 MHz. A full pre-test backup of the array is at
+`host/backups/20260916-211506_dump_E000-FFFF.s19`.

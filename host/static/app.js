@@ -353,6 +353,17 @@ function setSynced(v) {
 // =======================================================================
 // Connection
 // =======================================================================
+// The Connection panel's readout and the header's link pill are the SAME
+// fact, so they are written in one place. The header carries it because a
+// dropped link is global news -- it invalidates every panel at once, and the
+// Connection panel may well be behind an open slide-over when it happens.
+function setLinkState(text, cls) {
+  $("sync-readout").textContent = text;
+  const h = $("header-link");
+  h.textContent = text;
+  h.className = "hdr-link " + (cls || "off");
+}
+
 async function refreshPorts() {
   const data = await api("/api/ports");
   const select = $("port-select");
@@ -378,6 +389,7 @@ $("connect-btn").addEventListener("click", async () => {
   try {
     const d = await jsonPost("/api/connect", { port });
     setConnected(true);
+    setLinkState("connected — not synced", "warn");
     log(
       d.already_connected
         ? `already connected to ${port} (the server never dropped it)`
@@ -416,9 +428,11 @@ async function probeExistingLink() {
     const info = await api("/api/chip_info?identify=1&ram_probe=1");
     if (info.id_ok) {
       setSynced(true);
-      $("sync-readout").textContent = info.bus_clock_hz
-        ? `link live — ${(info.bus_clock_hz / 1e6).toFixed(3)} MHz`
-        : "link live";
+      setLinkState(
+        info.bus_clock_hz
+          ? `link live — ${(info.bus_clock_hz / 1e6).toFixed(3)} MHz`
+          : "link live",
+        "live");
       renderChipInfo(info);
       log(
         "the BDC link is already live (the server was synced before this " +
@@ -439,7 +453,7 @@ $("disconnect-btn").addEventListener("click", async () => {
   try {
     await api("/api/disconnect", { method: "POST" });
     setConnected(false);
-    $("sync-readout").textContent = "not synced";
+    setLinkState("not connected", "off");
     log("disconnected");
   } catch (e) {
     log(e.message, "err");
@@ -451,7 +465,7 @@ $("sync-btn").addEventListener("click", async () => {
   try {
     const data = await jsonPost("/api/sync");
     const mhz = (data.target_freq_hz / 1e6).toFixed(3);
-    $("sync-readout").textContent = `target clock ~${mhz} MHz`;
+    setLinkState(`synced — ${mhz} MHz`, "live");
     setSynced(true);
     $("bus-freq").value = String(Math.round(data.target_freq_hz));
     log(`synced — target clock ~${mhz} MHz (bus clock field updated)`, "ok");
@@ -474,7 +488,7 @@ async function relink() {
     if (d.validated) {
       setSynced(true);
       const mhz = (d.bit_clock_hz / 1e6).toFixed(3);
-      $("sync-readout").textContent = `relinked — ${mhz} MHz`;
+      setLinkState(`relinked — ${mhz} MHz`, "live");
       $("bus-freq").value = String(d.bit_clock_hz);
       log(
         `relinked at ${mhz} MHz without resetting the target ` +
@@ -501,7 +515,7 @@ $("reset-target-btn").addEventListener("click", async () => {
   try {
     await jsonPost("/api/reset_target");
     setSynced(false);
-    $("sync-readout").textContent = "not synced";
+    setLinkState("reset — not synced", "warn");
     log("target reset (plain RESET pulse — running its own code)", "ok");
   } catch (e) {
     log(e.message, "err");
@@ -980,6 +994,9 @@ function showLinkLost(msg) {
   $("bdcscr-readout").textContent = "BDCSCR — (no answer)";
   $("bdcscr-bits").innerHTML = "";
   updatePackage(null);
+  const h = $("header-link");
+  h.textContent = "LINK LOST";
+  h.className = "hdr-link lost";
 }
 
 function renderLiveState(s) {
