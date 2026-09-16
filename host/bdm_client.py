@@ -15,6 +15,18 @@ class BdmClientError(Exception):
     pass
 
 
+class BdmBusyError(BdmClientError):
+    """The serial link is held by another operation (a flash write, a wipe).
+
+    Raised only by try_transaction(), i.e. by callers that would rather be
+    told "busy" immediately than queue behind a 30-second FLASH operation.
+    The live-state poller is exactly that caller: blocking there would pile
+    up a request per poll tick for the whole duration of a flash write and
+    then deliver a burst of stale snapshots when it finished.
+    """
+    pass
+
+
 class BdmClient:
     def __init__(self):
         self._ser = None
@@ -58,6 +70,13 @@ class BdmClient:
     def is_connected(self):
         return self._ser is not None and self._ser.is_open
 
+    @property
+    def port(self):
+        """Name of the open port, or None. Lets the app tell 'connect to
+        the port I am already on' (idempotent) apart from 'connect to a
+        different port' (a real switch)."""
+        return self._ser.port if self._ser is not None else None
+
     @contextlib.contextmanager
     def transaction(self):
         """Hold the serial lock across a whole logical operation.
@@ -75,6 +94,30 @@ class BdmClient:
         """
         with self._lock:
             yield self
+
+    @contextlib.contextmanager
+    def try_transaction(self, timeout=0.05):
+        """transaction(), but give up instead of queueing.
+
+        Nothing here is preemptive: the RLock is fair enough that a poller
+        cannot starve a flash write, and a flash write cannot deadlock a
+        poller -- it just makes it wait. For a poll, waiting is the wrong
+        answer, so this raises BdmBusyError and the route reports busy.
+        """
+        if not self._lock.acquire(timeout=timeout):
+            raise BdmBusyError("the BDM link is busy with another operation")
+        try:
+            yield self
+        finally:
+            self._lock.release()
+
+    @property
+    def busy(self):
+        """True if some other thread currently holds the link."""
+        if not self._lock.acquire(blocking=False):
+            return True
+        self._lock.release()
+        return False
 
     def _call(self, cmd_dict, timeout=5):
         if not self.is_connected:
@@ -154,6 +197,16 @@ class BdmClient:
     def read_status(self):
         return self._call({"cmd": "read_status"})["value"]
 
+    def background(self):
+        """BDC BACKGROUND: halt the CPU into active background mode.
+
+        The firmware has had this verb since the start; the host had no
+        wrapper for it, so a UI could resume a target (go/step) but never
+        stop one without a power-on re-entry. ENBDM must already be 1 for
+        BACKGROUND to take effect (Finding 100); the caller checks BDCSCR.
+        """
+        self._call({"cmd": "background"})
+
     def go(self):
         self._call({"cmd": "go"})
 
@@ -209,6 +262,92 @@ class BdmClient:
             "sample_period_ns": resp["sample_period_ns"],
             "bit_value": resp.get("bit_value"),
         }
+
+    # -- ELEVENTH session: safety, security, and state ---------------------
+    def chip_info(self, bus_freq_hz=None, blank_check=False):
+        req = {"cmd": "chip_info", "blank_check": bool(blank_check)}
+        if bus_freq_hz:
+            req["bus_freq_hz"] = int(bus_freq_hz)
+        resp = self._call(req, timeout=15)
+        resp.pop("ok", None)
+        return resp
+
+    def identify(self, ram_probe=True, defect_scan=False):
+        resp = self._call(
+            {"cmd": "identify", "ram_probe": bool(ram_probe),
+             "defect_scan": bool(defect_scan)},
+            timeout=20,
+        )
+        resp.pop("ok", None)
+        return resp
+
+    def live_state(self, cpu_regs=True, ports=True):
+        resp = self._call(
+            {"cmd": "live_state", "cpu_regs": bool(cpu_regs),
+             "ports": bool(ports)},
+            timeout=10,
+        )
+        resp.pop("ok", None)
+        return resp
+
+    def relink(self):
+        """Recover the link to a RUNNING target without power-cycling it."""
+        resp = self._call({"cmd": "relink"}, timeout=30)
+        resp.pop("ok", None)
+        return resp
+
+    def power_state(self):
+        resp = self._call({"cmd": "power_state"}, timeout=10)
+        resp.pop("ok", None)
+        return resp
+
+    def security_state(self):
+        resp = self._call({"cmd": "security"}, timeout=10)
+        resp.pop("ok", None)
+        return resp
+
+    def set_security(self, nvopt=0xFC, bus_freq_hz=None):
+        req = {"cmd": "set_security", "nvopt": int(nvopt)}
+        if bus_freq_hz:
+            req["bus_freq_hz"] = int(bus_freq_hz)
+        resp = self._call(req, timeout=20)
+        resp.pop("ok", None)
+        return resp
+
+    def unsecure(self, bus_freq_hz=None, restore_nvopt=0xFE):
+        """Mass erase + erase-verify + NVOPT restore, reported step by step.
+
+        Generous timeout: a mass erase plus a blank check plus their FSTAT
+        polling is seconds of target time, and the Pico answers only when
+        the whole sequence is done.
+        """
+        req = {"cmd": "unsecure"}
+        if bus_freq_hz:
+            req["bus_freq_hz"] = int(bus_freq_hz)
+        if restore_nvopt is not None:
+            req["restore_nvopt"] = int(restore_nvopt)
+        resp = self._call(req, timeout=60)
+        resp.pop("ok", None)
+        return resp
+
+    def flash_image(self, chunks, bus_freq_hz=None, erase=True, nvopt=0xFE,
+                    verify=True, timeout=180):
+        """chunks: iterable of (addr, bytes). Page-at-a-time on the Pico."""
+        req = {
+            "cmd": "flash_image",
+            "chunks": [
+                {"addr": int(a), "data_b64": base64.b64encode(bytes(d)).decode()}
+                for a, d in chunks
+            ],
+            "erase": bool(erase),
+            "nvopt": int(nvopt),
+            "verify": bool(verify),
+        }
+        if bus_freq_hz:
+            req["bus_freq_hz"] = int(bus_freq_hz)
+        resp = self._call(req, timeout=timeout)
+        resp.pop("ok", None)
+        return resp
 
     def flash_write(self, addr, data: bytes, erase_pages=True):
         b64 = base64.b64encode(data).decode()

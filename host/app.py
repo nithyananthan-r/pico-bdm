@@ -6,11 +6,16 @@ Run with:
 then open http://127.0.0.1:5000
 """
 
+import os
+import threading
+import time
+import traceback
+
 from flask import Flask, jsonify, request, render_template
 from werkzeug.exceptions import HTTPException
 
-from bdm_client import client, BdmClientError
-from srec import parse_srec, merge_contiguous
+from bdm_client import client, BdmClientError, BdmBusyError
+from srec import parse_srec, merge_contiguous, build_srec
 
 app = Flask(__name__)
 
@@ -31,6 +36,22 @@ MAX_READ_BLOCK_LEN = 1024
 
 # 16-bit address space on this part.
 ADDR_MAX = 0xFFFF
+
+# FLASH array of the MC9S08SG8 in the socket: 8 KB at the top of the map.
+# (The SG4's 4 KB build starts at $F000; both end at $FFFF.) Used as the
+# default region for dumps and for the automatic backup taken before a
+# destructive operation.
+FLASH_START = 0xE000
+FLASH_END = 0xFFFF
+
+# Where automatic pre-destruction backups land. Kept next to the app so a
+# bench user can find them without being told.
+BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
+
+# One read_block round trip per this many bytes when dumping. Measured on
+# hardware: ~1.6 ms/byte, so 256 bytes is ~0.4 s per call -- comfortably
+# inside the serial timeout, and 8 KB (the whole FLASH array) is ~13 s.
+DUMP_CHUNK = 256
 
 # FLASH page size on the SG8/SG4 (see firmware/bdc.py PAGE_SIZE). Kept in
 # sync manually; used here to compute the union of pages an S-record file
@@ -87,6 +108,37 @@ def handle_http_exception(e):
             e.code or 500,
         )
     return e
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_exception(e):
+    """Same contract as the HTTPException handler above, for the errors that
+    are NOT HTTPExceptions.
+
+    Hit for real this session: pyserial raised
+    `SerialException: Cannot configure port ... PermissionError(13)` from
+    inside /api/chip_info after the Pico's USB CDC re-enumerated. Nothing
+    caught it (the routes catch BdmClientError, and SerialException is an
+    OSError), so Flask rendered the debugger's HTML page, app.js's
+    res.json() choked on it, and the UI reported
+    "Unexpected token '<'" -- which says nothing about a dropped USB device.
+
+    The traceback still goes to the console, where a bench user wants it.
+    """
+    if isinstance(e, HTTPException):
+        return handle_http_exception(e)
+    if not request.path.startswith("/api/"):
+        raise e
+    traceback.print_exc()
+    msg = "%s: %s" % (type(e).__name__, e)
+    if isinstance(e, OSError):
+        # SerialException subclasses IOError/OSError.
+        msg += (
+            " -- the serial handle to the Pico is no longer usable. The port "
+            "most likely re-enumerated (Pico reset or replugged). Disconnect "
+            "and Connect again, then Sync target."
+        )
+    return jsonify({"ok": False, "error": msg}), 500
 
 
 def api_error(exc, status=400):
@@ -157,15 +209,24 @@ def api_connect():
         port = json_body().get("port")
         if not port:
             return api_error("missing 'port'")
+        # Already on this port? Don't reopen it. Windows gives exclusive
+        # access to a COM port, so a second open of the SAME port fails with
+        # "Access is denied" -- and the old error path then disconnected the
+        # perfectly good connection it was holding, which turned a harmless
+        # duplicate connect into "not connected to a Pico" for everything
+        # afterwards. Measured, this session.
+        if client.is_connected and client.port == port:
+            client.ping()
+            return jsonify({"ok": True, "already_connected": True})
+        was_connected = client.is_connected
         client.connect(port)
         client.ping()
-        return jsonify({"ok": True})
+        return jsonify({"ok": True, "already_connected": False})
     except (BdmClientError, OSError, ValueError) as e:
-        # Only tear down if we actually got the port open. connect() no
-        # longer clobbers a previous good connection on failure, so an
-        # unconditional disconnect() here would close a connection that is
-        # still fine.
-        if client.is_connected:
+        # Only tear down a connection this call actually created. connect()
+        # leaves an existing good connection alone on failure, so closing it
+        # here would be this handler destroying working state.
+        if client.is_connected and not was_connected:
             client.disconnect()
         return api_error(e)
 
@@ -308,6 +369,27 @@ def api_mass_erase():
         return api_error(e)
 
 
+@app.route("/api/halt", methods=["POST"])
+def api_halt():
+    """BDC BACKGROUND -- stop a running target and enter active background
+    mode, without resetting it.
+
+    -> {"ok":true,"bdcscr":200,"halted":true}
+
+    `halted` is read back from BDCSCR.BDMACT rather than assumed: BACKGROUND
+    is ignored unless ENBDM is already 1 (Finding 100), and a debugger panel
+    must not claim a halt it did not get.
+    """
+    try:
+        with client.transaction():
+            client.background()
+            status = client.read_status()
+        return jsonify({"ok": True, "bdcscr": status,
+                        "halted": bool(status != 0xFF and status & 0x40)})
+    except BdmClientError as e:
+        return api_error(e)
+
+
 @app.route("/api/go", methods=["POST"])
 def api_go():
     try:
@@ -420,34 +502,195 @@ def api_capture():
         return api_error(e)
 
 
-def _pages_touched(chunks, page_size=FLASH_PAGE_SIZE):
-    """Union of FLASH pages covered by every chunk.
+# The union-of-pages computation that used to live here (_pages_touched) is
+# gone: firmware's flash_program_image() builds the page map from all chunks
+# itself, so the "chunk B's erase wipes chunk A" hazard it worked around
+# cannot arise -- a page is erased exactly once, then every byte belonging to
+# it, from whichever chunk, is programmed and verified before the next page.
 
-    This is the fix for the C3 hazard: erasing and programming chunk by
-    chunk means that if two chunks land in the SAME 512-byte page (routine
-    in real toolchain output), programming chunk A and then erasing for
-    chunk B wipes A -- and the per-chunk verify never notices, because it
-    only re-reads the chunk it just wrote. Erase the union once, up front,
-    then program every chunk with erasing turned off.
-    """
-    pages = set()
+
+# ---------------------------------------------------------------------------
+# TWELFTH session: real-time programming progress.
+#
+# The Pico answers ONE flash_image command when the WHOLE image is done, so
+# a synchronous /api/flash_srec cannot report anything until it is over --
+# and a UI animating "progress" during that silence would be inventing it.
+#
+# So the optional async path here drives the SAME firmware routine one page
+# at a time (firmware's flash_program_image builds its page map from the
+# chunks it is given; giving it exactly one page's worth makes each round
+# trip one page's erase -> program -> verify) and publishes each page's REAL
+# report the moment the Pico returns it. Everything the UI animates is
+# therefore a measurement, not a timer: a page is "in flight" from the
+# moment its command goes out, and becomes erased/programmed/verified only
+# when the target says so.
+#
+# The synchronous path is untouched and is still the default.
+# ---------------------------------------------------------------------------
+_flash_job = {"id": 0, "state": "idle"}
+_flash_job_lock = threading.Lock()
+
+
+def _job_update(**kw):
+    with _flash_job_lock:
+        _flash_job.update(kw)
+
+
+def _job_snapshot():
+    with _flash_job_lock:
+        return dict(_flash_job)
+
+
+def _page_map(chunks):
+    """(page addr) -> {addr: byte}, exactly as firmware builds it."""
+    pages = {}
     for addr, data in chunks:
-        if not data:
+        for i in range(len(data)):
+            a = addr + i
+            pages.setdefault(a - (a % FLASH_PAGE_SIZE), {})[a] = data[i]
+    return pages
+
+
+def _page_chunks(cells):
+    """{addr: byte} -> list of (addr, bytes) contiguous runs."""
+    out = []
+    run_start = None
+    run = bytearray()
+    for a in sorted(cells):
+        if run_start is not None and a == run_start + len(run):
+            run.append(cells[a])
             continue
-        first = addr - (addr % page_size)
-        last = addr + len(data) - 1
-        last -= last % page_size
-        for page in range(first, last + 1, page_size):
-            pages.add(page)
-    return sorted(pages)
+        if run_start is not None:
+            out.append((run_start, bytes(run)))
+        run_start, run = a, bytearray([cells[a]])
+    if run_start is not None:
+        out.append((run_start, bytes(run)))
+    return out
+
+
+def _flash_worker(job_id, chunks, bus_freq_hz, erase_mode, nvopt):
+    pages = _page_map(chunks)
+    order = sorted(pages)
+    started = time.time()
+    try:
+        with client.transaction():
+            if erase_mode == "mass":
+                _job_update(phase="mass_erase", current_page=None)
+                client.flash_init_clock(bus_freq_hz)
+                client.mass_erase()
+
+            done = []
+            written = 0
+            for idx, page in enumerate(order):
+                cells = pages[page]
+                _job_update(
+                    phase="page", current_page=page, current_index=idx,
+                    current_bytes=len(cells), pages=list(done),
+                    total_bytes=written, elapsed=time.time() - started,
+                )
+                rep = client.flash_image(
+                    _page_chunks(cells),
+                    bus_freq_hz=bus_freq_hz,
+                    erase=(erase_mode == "pages"),
+                    nvopt=nvopt,
+                )
+                entry = (rep.get("pages") or [{"page": page}])[0]
+                done.append(entry)
+                written += rep.get("bytes_written", 0)
+                _job_update(
+                    pages=list(done), total_bytes=written,
+                    security_risk=bool(rep.get("security_risk")),
+                    elapsed=time.time() - started,
+                )
+                if not rep.get("complete"):
+                    # Stop at the first failing page. Every page before it
+                    # is confirmed good and is already in `pages`, so the UI
+                    # can name exactly what landed and what did not.
+                    _job_update(
+                        state="failed", phase="failed",
+                        error=rep.get("error") or "page $%04X failed" % page,
+                        failed_page=page, complete=False,
+                        elapsed=time.time() - started,
+                    )
+                    return
+
+            if erase_mode == "mass" and not any(
+                a <= 0xFFBF < a + len(d) for a, d in chunks
+            ):
+                _job_update(phase="nvopt_restore")
+                sec = client.set_security(nvopt=nvopt, bus_freq_hz=None)
+                _job_update(
+                    nvopt_restored=sec.get("after"),
+                    nvopt_restore_verified=bool(sec.get("written")),
+                    security_risk=not sec.get("written", False),
+                )
+
+        _job_update(state="done", phase="done", complete=True, error=None,
+                    failed_page=None, current_page=None,
+                    elapsed=time.time() - started)
+    except Exception as e:  # BdmClientError, serial errors, anything
+        _job_update(state="failed", phase="failed", complete=False,
+                    error="%s: %s" % (type(e).__name__, e),
+                    elapsed=time.time() - started)
+
+
+@app.route("/api/flash_progress")
+def api_flash_progress():
+    """Poll the async programming job started by
+    POST /api/flash_srec with form field `async=1`.
+
+    -> {"ok":true,"id":3,"state":"running"|"done"|"failed"|"idle",
+        "phase":"page","current_page":57344,"current_index":0,
+        "pages_planned":[{"page":57344,"bytes":192},...],
+        "pages":[{"page":57344,"bytes":192,"erased":true,"programmed":192,
+                  "verified":true}],
+        "total_bytes":192,"complete":false,"error":null,
+        "security_risk":false,"elapsed":1.2}
+
+    `pages` only ever contains pages the TARGET has confirmed; a page that
+    is in flight appears as `current_page` and nowhere else.
+    """
+    return jsonify({"ok": True, **_job_snapshot()})
 
 
 @app.route("/api/flash_srec", methods=["POST"])
 def api_flash_srec():
     """
     Accepts a multipart-form upload with an .s19 file under 'file', plus a
-    'bus_freq_hz' form field for FCDIV setup. Parses it, merges contiguous
-    runs, erases the union of pages those runs touch, and writes each run.
+    'bus_freq_hz' form field for FCDIV setup.
+
+    PROGRAMMING IS NOW PAGE AT A TIME: erase page -> program that page ->
+    verify that page -> move on, all inside the Pico (a host-driven byte
+    costs ~17 ms of USB round trip). That is the achievable form of
+    power-loss protection on this wiring -- there is no VDD sense line to
+    interrupt on, so instead every page is confirmed good before the next
+    one is touched, and a failure names the page and address it stopped at
+    rather than leaving an uncharacterised half-written array.
+
+    The $FE00/$FFBF hazard (CONTEXT.md Finding 95) is handled inside that
+    loop: erasing the last page blanks NVOPT and the part re-secures itself
+    at the next reset, so NVOPT is reprogrammed immediately after that
+    page's erase, before any other byte of it, and `security_risk` in the
+    response is True only if the run died inside that window.
+
+    Form fields:
+      file          the .s19                                    (required)
+      bus_freq_hz   for FCDIV (default 8000000; SYNC's measured rate is
+                    fBus on this part, CLKSW=1)
+      erase_mode    pages (default) | mass | none
+      nvopt         NVOPT byte to restore if page $FE00 is erased and the
+                    image does not itself contain $FFBF (default 0xFE =
+                    unsecured)
+
+    -> {"ok":true,"complete":true,"security_risk":false,"error":null,
+        "total_bytes":195,"nvopt":254,"erase_mode":"pages","pages_erased":2,
+        "pages":[{"page":57344,"bytes":192,"erased":true,"programmed":192,
+                  "verified":true},
+                 {"page":65024,"bytes":3,"erased":true,"nvopt_restored":254,
+                  "programmed":2,"verified":true}],
+        "chunks":[{"addr":57344,"len":192}, ...]}
+    On a failure the same shape comes back with HTTP 400, "complete":false,
+    an "error" string, and the pages that DID verify still listed.
     """
     try:
         bus_freq_hz = to_int(request.form.get("bus_freq_hz", "8000000"), "bus_freq_hz")
@@ -469,47 +712,565 @@ def api_flash_srec():
             check_range(addr, "record address", 0, ADDR_MAX)
             check_range(addr + len(data) - 1, "record end address", 0, ADDR_MAX)
 
+        nvopt = byte_arg(request.form.get("nvopt", 0xFE), "nvopt")
+
+        # Opt-in async mode: run the same page-at-a-time programming on a
+        # worker thread and publish each page's real report to
+        # /api/flash_progress as the target confirms it. The default path
+        # below is unchanged.
+        if _bool_arg(request.form.get("async")):
+            snap = _job_snapshot()
+            if snap.get("state") == "running":
+                return api_error("a programming job is already running")
+            pages = _page_map(chunks)
+            planned = [{"page": p, "bytes": len(pages[p])} for p in sorted(pages)]
+            job_id = snap.get("id", 0) + 1
+            with _flash_job_lock:
+                _flash_job.clear()
+                _flash_job.update({
+                    "id": job_id, "state": "running", "phase": "starting",
+                    "pages_planned": planned, "pages": [], "total_bytes": 0,
+                    "erase_mode": erase_mode, "nvopt": nvopt,
+                    "chunks": [{"addr": a, "len": len(d)} for a, d in chunks],
+                    "complete": False, "error": None, "security_risk": False,
+                    "current_page": None, "failed_page": None, "elapsed": 0.0,
+                })
+            threading.Thread(
+                target=_flash_worker,
+                args=(job_id, chunks, bus_freq_hz, erase_mode, nvopt),
+                daemon=True,
+            ).start()
+            return jsonify({"ok": True, "async": True, "job_id": job_id,
+                            "pages_planned": planned}), 202
+
         # One lock for the whole programming operation. A FLASH command is a
         # multi-write sequence on the target; letting another tab interleave
         # a read in the middle of it is exactly how you provoke a FACCERR.
         with client.transaction():
-            client.flash_init_clock(bus_freq_hz)
-
-            erased_pages = []
             if erase_mode == "mass":
+                # A mass erase blanks NVOPT too, and the part would
+                # re-secure at the next reset -- so the image is programmed
+                # with erase=False afterwards and NVOPT is restored as part
+                # of that run only if the image covers page $FE00. Make sure
+                # it does.
+                client.flash_init_clock(bus_freq_hz)
                 client.mass_erase()
-            elif erase_mode == "pages":
-                erased_pages = _pages_touched(chunks)
-                for page in erased_pages:
-                    client.flash_erase_page(page)
 
-            results = []
-            total = 0
-            for addr, data in chunks:
-                # Always erase_pages=False: erasing already happened above,
-                # as a union across all chunks. Per-chunk erasing here would
-                # reintroduce the clobber bug described in _pages_touched().
-                #
-                # Verification is NOT repeated here on purpose. firmware's
-                # flash_write_region() already reads every byte back and
-                # compares before returning, and a BDC read is one byte per
-                # round-trip -- re-reading from the host would exactly
-                # double the slowest operation in the stack for no extra
-                # coverage. The UI's "Verify after write" checkbox is now
-                # informational only; the firmware verify is unconditional.
-                n = client.flash_write(addr, data, erase_pages=False)
-                total += n
-                results.append({"addr": addr, "len": n})
+            rep = client.flash_image(
+                chunks,
+                bus_freq_hz=bus_freq_hz,
+                erase=(erase_mode == "pages"),
+                nvopt=nvopt,
+            )
 
-        return jsonify(
-            {
-                "ok": True,
-                "chunks": results,
-                "total_bytes": total,
-                "pages_erased": len(erased_pages),
-                "erase_mode": erase_mode,
+            if erase_mode == "mass" and not any(
+                a <= 0xFFBF < a + len(d) for a, d in chunks
+            ):
+                # The mass erase left NVOPT blank (0xFF = SEC 1:1) and the
+                # image did not rewrite it. Close the window now, in this
+                # same power cycle, or the chip locks itself at the next
+                # reset (Finding 95).
+                sec = client.set_security(nvopt=nvopt, bus_freq_hz=None)
+                rep["nvopt_restored"] = sec.get("after")
+                rep["nvopt_restore_verified"] = bool(sec.get("written"))
+                rep["security_risk"] = not sec.get("written", False)
+
+        payload = {
+            "ok": bool(rep.get("complete")),
+            "chunks": [{"addr": a, "len": len(d)} for a, d in chunks],
+            "total_bytes": rep.get("bytes_written", 0),
+            # "mass" when the whole array went in one command, otherwise the
+            # number of pages this run erased individually.
+            "pages_erased": ("mass" if erase_mode == "mass" else
+                             sum(1 for p in rep.get("pages", [])
+                                 if p.get("erased"))),
+            "erase_mode": erase_mode,
+            **rep,
+        }
+        if rep.get("security_risk"):
+            payload["warning"] = (
+                "CHIP MAY BE LEFT IN A SELF-SECURING STATE: page $FE00 was "
+                "erased and NVOPT at $FFBF was not confirmed rewritten. DO "
+                "NOT POWER-CYCLE THE TARGET -- rewrite $FFBF now (POST "
+                "/api/security with the intended value), or the part will "
+                "secure itself at the next reset and need a full wipe "
+                "(/api/unsecure) to recover."
+            )
+        return jsonify(payload), (200 if rep.get("complete") else 400)
+    except (BdmClientError, KeyError, ValueError) as e:
+        return api_error(e)
+
+
+# ---------------------------------------------------------------------------
+# ELEVENTH session: chip info, live state, security, recovery, verify, dump.
+#
+# Response shape convention for everything below: HTTP 200 with
+# {"ok": true, ...} on success, HTTP 400 with {"ok": false, "error": "..."}
+# on failure -- except the pollable route, which answers 200 with
+# {"ok": true, "busy": true} when the link is held by a long operation
+# rather than queueing behind it.
+# ---------------------------------------------------------------------------
+def _bool_arg(value, default=False):
+    if value is None:
+        return default
+    return str(value).lower() in ("1", "true", "yes", "on")
+
+
+def _dump_region(addr, length):
+    """Read `length` bytes starting at `addr`. Call inside a transaction."""
+    out = bytearray()
+    while len(out) < length:
+        n = min(DUMP_CHUNK, length - len(out))
+        out += client.read_block(addr + len(out), n)
+    return bytes(out)
+
+
+def _auto_backup(reason, addr=FLASH_START, length=None):
+    """Read the FLASH array to a timestamped .s19 before doing something
+    destructive. Call inside a transaction.
+
+    A secured part answers every FLASH read with 0x00 (Finding 95), so a
+    "backup" taken then would be 8 KB of zeros masquerading as the chip's
+    contents. That case is detected and reported as skipped, with the
+    reason, instead of writing a worthless file.
+    """
+    if length is None:
+        length = FLASH_END - addr + 1
+    sec = client.security_state()
+    if sec.get("secured"):
+        return {
+            "taken": False,
+            "reason": "the part is secured: every FLASH read returns 0x00, "
+                      "so its contents cannot be backed up. Nothing readable "
+                      "is being destroyed.",
+            "security": sec,
+        }
+    data = _dump_region(addr, length)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    name = "%s_%s_%04X-%04X.s19" % (
+        time.strftime("%Y%m%d-%H%M%S"), reason, addr, addr + length - 1
+    )
+    path = os.path.join(BACKUP_DIR, name)
+    with open(path, "w") as fh:
+        fh.write(build_srec([(addr, data)], header="PICOBDM-BACKUP"))
+    return {
+        "taken": True,
+        "path": path,
+        "addr": addr,
+        "length": length,
+        "blank": all(b == 0xFF for b in data),
+        "sha_prefix": data[:16].hex(),
+    }
+
+
+@app.route("/api/chip_info")
+def api_chip_info():
+    """What chip is this and what state is it in. Meant to run on connect.
+
+    GET /api/chip_info[?blank_check=1]
+    -> {"ok":true, "sdidh":160,"sdidl":20,"part_id":20,"rev":10,"id_ok":true,
+        "srs":130,"reset_source":{"por":true,...},"sopt1":192,"spmsc1":28,
+        "fcdiv":180,"fprot":255,"fstat":192,"bdcscr":200,"clksw":true,
+        "bdc_clock_hz":9248555,"bus_clock_hz":9248555,
+        "security":{"fopt":194,"sec":2,"secured":false,"keyen":true,
+                    "fnored":true,"nvopt":254,"nvopt_trustworthy":true,
+                    "suspect_link":false},
+        "blank":false}
+    blank_check runs the FLASH module's own erase-verify and therefore needs
+    FCDIV, so it is opt-in and needs SYNC to have run first.
+    """
+    try:
+        blank = _bool_arg(request.args.get("blank_check"))
+        identify = _bool_arg(request.args.get("identify"), True)
+        ram_probe = _bool_arg(request.args.get("ram_probe"), False)
+        defect_scan = _bool_arg(request.args.get("defect_scan"))
+        with client.transaction():
+            info = client.chip_info(
+                bus_freq_hz=_last_bus_hz if blank else None,
+                blank_check=blank,
+            )
+            if identify:
+                info["identity"] = client.identify(
+                    ram_probe=ram_probe, defect_scan=defect_scan
+                )
+        return jsonify({"ok": True, **info})
+    except BdmClientError as e:
+        return api_error(e)
+
+
+@app.route("/api/identify")
+def api_identify():
+    """Which MCU is in the socket, in words rather than hex.
+
+    GET /api/identify[?ram_probe=1][&defect_scan=1]
+    -> {"ok":true,"sdidh":160,"sdidl":20,"part_id":20,"part_id_hex":"0x014",
+        "rev":10,"family":"MC9S08SG8 / MC9S08SG4 (HCS08 SG family)",
+        "variants":["MC9S08SG8","MC9S08SG4"],
+        "name":"MC9S08SG8","confidence":"probed",
+        "evidence":"RAM at $0240 holds written data, so this part has the
+                    SG8's 512 B array",
+        "ram_bytes":512,"flash_kb":8,"flash_start":57344,
+        "bad_ram_cells":[{"addr":96,"mask":127}, ...]}
+
+    SDID gives the FAMILY only -- the SG8 and SG4 share a part ID -- so
+    `confidence` is "id-only" until `ram_probe=1` settles the derivative by
+    testing whether $0240 exists (it does on the SG8's 512 B array, not on
+    the SG4's 256 B one). The probe writes and restores a single RAM byte,
+    which is why it is opt-in rather than part of every status read;
+    `defect_scan=1` does the same across $0060-$006F and reports this die's
+    per-address AND masks.
+    """
+    try:
+        with client.transaction():
+            return jsonify({"ok": True, **client.identify(
+                ram_probe=_bool_arg(request.args.get("ram_probe"), True),
+                defect_scan=_bool_arg(request.args.get("defect_scan")),
+            )})
+    except BdmClientError as e:
+        return api_error(e)
+
+
+def _expand_port(data, ddr, name, pins=8):
+    """Turn a (data, direction) register pair into per-pin facts.
+
+    `level` is what the pin register reads; for an input that is the pin,
+    for an output it is the value being driven. Saying which of the two it
+    is, is the whole point of shipping `direction` alongside it.
+    """
+    if data is None or ddr is None:
+        return None
+    return [
+        {
+            "pin": "PT%s%d" % (name, i),
+            "direction": "out" if (ddr >> i) & 1 else "in",
+            "level": (data >> i) & 1,
+        }
+        for i in range(pins)
+    ]
+
+
+@app.route("/api/live_state")
+def api_live_state():
+    """Pollable snapshot for the live-debug panel. ~0.13 s per call on
+    hardware, so a few polls a second is comfortable.
+
+    GET /api/live_state[?cpu_regs=0][?ports=0]
+    -> {"ok":true,"busy":false,
+        "bdcscr":{"value":200,"enbdm":true,"bdmact":true,"bkpten":false,
+                  "fts":false,"clksw":true,"ws":false,"wsf":false,"dvf":false},
+        "bkpt":{"addr":0,"enabled":false,"tag_mode":false},
+        "ports":{"raw":{"ptad":0,"ptadd":0,"ptbd":192,...},
+                 "A":[{"pin":"PTA0","direction":"in","level":0}, ...],
+                 "B":[...], "C":[...],
+                 "note":"PTC is read anyway ..."},
+        "cpu_regs":{"A":{"available":true,"value":0,"raw":0,
+                         "ambiguous":false,"reason":null}, ...}}
+
+    If a flash/erase operation holds the link, this returns
+    {"ok":true,"busy":true} IMMEDIATELY instead of blocking -- see
+    BdmClient.try_transaction. Polling therefore cannot pile up behind a
+    long operation, and cannot deadlock against one either.
+    """
+    try:
+        cpu_regs = _bool_arg(request.args.get("cpu_regs"), True)
+        ports = _bool_arg(request.args.get("ports"), True)
+        try:
+            with client.try_transaction():
+                state = client.live_state(cpu_regs=cpu_regs, ports=ports)
+        except BdmBusyError:
+            return jsonify({"ok": True, "busy": True})
+        raw = state.get("ports")
+        if raw:
+            state["ports"] = {
+                "raw": raw,
+                "A": _expand_port(raw.get("ptad"), raw.get("ptadd"), "A"),
+                "B": _expand_port(raw.get("ptbd"), raw.get("ptbdd"), "B"),
+                "C": _expand_port(raw.get("ptcd"), raw.get("ptcdd"), "C"),
+                "note": "PTA/PTB are bonded out on this package; PTC is read "
+                        "and reported raw but may not exist on this part.",
             }
-        )
+        return jsonify({"ok": True, "busy": False, **state})
+    except BdmClientError as e:
+        return api_error(e)
+
+
+@app.route("/api/relink", methods=["POST"])
+def api_relink():
+    """Recover the BDC link to a target that is RUNNING, without resetting
+    it. Use this when /api/live_state comes back {"link_ok": false}.
+
+    POST /api/relink
+    -> {"ok":true,"validated":true,"bit_clock_hz":9302326,
+        "sync_raw_hz":18604652,"status":152,
+        "tried":[{"hz":18604652,"value":82,"status":37},
+                 {"hz":9302326,"value":20,"status":152}]}
+
+    /api/sync cannot do this job: its BDM entry is a POWER-ON reset, which
+    restarts whatever the target was doing. This only re-measures the bit
+    rate (trying half, per Finding 99) and re-asserts ENBDM (Finding 100).
+    `validated` is whether SDIDL read back 0x14 afterwards -- if it is
+    false, the link is still not decoding and a power-on re-entry (/api/sync)
+    is the remaining option.
+    """
+    try:
+        with client.transaction():
+            rep = client.relink()
+        global _last_bus_hz
+        if rep.get("validated") and rep.get("bit_clock_hz"):
+            _last_bus_hz = int(rep["bit_clock_hz"])
+        return jsonify({"ok": True, **rep})
+    except BdmClientError as e:
+        return api_error(e)
+
+
+@app.route("/api/power")
+def api_power():
+    """What is known about target power, and what deliberately is not.
+
+    GET /api/power
+    -> {"ok":true,"vdd_pin":12,"vdd_driven_high":true,"bkgd_pin":15,
+        "reset_pin":14,"can_sense_voltage":false,
+        "reason":"target VDD is driven from GPIO12, which is not an
+                  ADC-capable pin (the RP2040 ADC reaches GPIO26-29 only),
+                  and no sense wire exists",
+        "adc_capable_pins":[26,27,28,29],
+        "witness":"a target that answers BDC commands is powered; that is
+                   the only in-band evidence available"}
+
+    There is no voltage measurement here and the endpoint says so, because
+    the alternative -- a UI showing an invented 3.3 V -- would be worse than
+    showing nothing. Power-loss protection on this hardware is therefore
+    sequencing (page-at-a-time erase/program/verify), not detection.
+    """
+    try:
+        with client.transaction():
+            return jsonify({"ok": True, **client.power_state()})
+    except BdmClientError as e:
+        return api_error(e)
+
+
+@app.route("/api/security")
+def api_security_get():
+    """GET /api/security
+    -> {"ok":true,"fopt":194,"sec":2,"secured":false,"keyen":true,
+        "fnored":true,"nvopt":254,"nvopt_trustworthy":true,
+        "suspect_link":false}
+
+    `secured` comes from FOPT ($1821), a peripheral register that answers
+    even on a locked part. `nvopt` is FLASH and reads 0x00 on a locked
+    part, which is why `nvopt_trustworthy` exists.
+    """
+    try:
+        with client.transaction():
+            return jsonify({"ok": True, **client.security_state()})
+    except BdmClientError as e:
+        return api_error(e)
+
+
+@app.route("/api/security", methods=["POST"])
+def api_security_set():
+    """Lock the part. THIS IS DESTRUCTIVE IN EFFECT: after the next reset
+    the chip refuses every FLASH and RAM access over BDM until it is wiped
+    with /api/unsecure, which erases everything on it.
+
+    POST /api/security {"confirm":"SECURE", "backup":true, "nvopt":252}
+    -> {"ok":true,"before":254,"wrote":252,"after":252,"written":true,
+        "fopt_now":194,"secured_now":false,
+        "takes_effect":"at the next reset / power cycle",
+        "backup":{"taken":true,"path":"...","length":8192,...},
+        "warning":"..."}
+
+    `confirm` is mandatory and must be the exact string "SECURE" -- this is
+    the one operation in the app that can make a chip unusable without
+    erasing it, and a mis-click should not be enough. The default nvopt
+    0xFC sets SEC = 0:0 by clearing a bit, so page $FE00 is NOT erased and
+    the Finding 95 hazard is never opened.
+    """
+    try:
+        body = json_body()
+        if body.get("confirm") != "SECURE":
+            return api_error(
+                'refusing to secure the part without {"confirm":"SECURE"} -- '
+                "after the next reset it will reject all FLASH/RAM access "
+                "until a full wipe (/api/unsecure) is run"
+            )
+        nvopt = byte_arg(body.get("nvopt", 0xFC), "nvopt")
+        want_backup = body.get("backup", True)
+        with client.transaction():
+            backup = _auto_backup("before-secure") if want_backup else \
+                {"taken": False, "reason": "not requested"}
+            result = client.set_security(nvopt=nvopt, bus_freq_hz=_last_bus_hz)
+        return jsonify({
+            "ok": True,
+            "backup": backup,
+            "warning": "the part locks itself at the NEXT reset; recovering "
+                       "it requires /api/unsecure, which mass-erases the "
+                       "whole FLASH array",
+            **result,
+        })
+    except (BdmClientError, ValueError) as e:
+        return api_error(e)
+
+
+@app.route("/api/unsecure", methods=["POST"])
+def api_unsecure():
+    """Forgot-passcode / full-wipe recovery. ERASES THE ENTIRE CHIP.
+
+    POST /api/unsecure {"confirm":"WIPE", "backup":true}
+    -> {"ok":true,"complete":true,"secured_before":true,"secured_after":false,
+        "erased":true,"error":null,
+        "steps":[{"step":"read_security","ok":true,"fopt":195,...},
+                 {"step":"flash_init_clock","ok":true,...},
+                 {"step":"mass_erase","ok":true,"fstat":192,...},
+                 {"step":"blank_check","ok":true,"blank":true,...},
+                 {"step":"flash_readable","ok":true,"addr":57344,"value":255},
+                 {"step":"security_released","ok":true,...},
+                 {"step":"restore_nvopt","ok":true,"wrote":254,"read":254}],
+        "backup":{...}}
+
+    The steps are the point: mass erase ALONE DOES NOT UNSECURE AN HCS08
+    (CONTEXT.md Finding 96) -- it is the blank check / erase-verify that
+    releases security -- so each step reports separately and a failure is
+    attributable to one of them. NVOPT is restored at the end because a
+    freshly erased NVOPT reads 0xFF = SEC 1:1, which would re-secure the
+    part at the next reset.
+    """
+    try:
+        body = json_body()
+        if body.get("confirm") != "WIPE":
+            return api_error(
+                'refusing to wipe without {"confirm":"WIPE"} -- this mass-'
+                "erases the entire FLASH array, including any program on it"
+            )
+        want_backup = body.get("backup", True)
+        with client.transaction():
+            backup = _auto_backup("before-wipe") if want_backup else \
+                {"taken": False, "reason": "not requested"}
+            rep = client.unsecure(bus_freq_hz=_last_bus_hz)
+        status = 200 if rep.get("complete") else 400
+        return jsonify({"ok": bool(rep.get("complete")), "backup": backup,
+                        **rep}), status
+    except (BdmClientError, ValueError) as e:
+        return api_error(e)
+
+
+@app.route("/api/dump")
+def api_dump():
+    """Read a region back off the chip. Use before anything destructive.
+
+    GET /api/dump[?addr=0xE000][&len=8192][&format=hex|s19][&save=1]
+    -> {"ok":true,"addr":57344,"length":8192,"format":"hex",
+        "hex":"8b899efe...", "blank":false,
+        "saved":"D:\\...\\host\\backups\\20260915-231500_dump_E000-FFFF.s19"}
+    format=s19 returns {"s19":"S0...\\nS1..."} instead of "hex".
+
+    Defaults to the whole 8 KB FLASH array. ~1.6 ms/byte, so a full dump is
+    about 13 s; it holds the serial lock for that time (the live-state
+    poller reports busy rather than queueing).
+    """
+    try:
+        addr = addr_arg(request.args.get("addr", FLASH_START))
+        length = to_int(request.args.get("len", FLASH_END - addr + 1), "len")
+        check_range(length, "len", 1, ADDR_MAX + 1)
+        if addr + length - 1 > ADDR_MAX:
+            return api_error("dump would run past the end of the address space")
+        fmt = request.args.get("format", "hex")
+        if fmt not in ("hex", "s19"):
+            return api_error("format must be 'hex' or 's19'")
+        with client.transaction():
+            data = _dump_region(addr, length)
+        resp = {"ok": True, "addr": addr, "length": length, "format": fmt,
+                "blank": all(b == 0xFF for b in data),
+                "all_zero": all(b == 0x00 for b in data)}
+        if resp["all_zero"]:
+            resp["note"] = ("every byte read 0x00, which is what a SECURED "
+                            "part returns for all of FLASH and RAM -- check "
+                            "/api/security before treating this as content")
+        if fmt == "s19":
+            resp["s19"] = build_srec([(addr, data)], header="PICOBDM-DUMP")
+        else:
+            resp["hex"] = data.hex()
+        if _bool_arg(request.args.get("save")):
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            path = os.path.join(BACKUP_DIR, "%s_dump_%04X-%04X.s19" % (
+                time.strftime("%Y%m%d-%H%M%S"), addr, addr + length - 1))
+            with open(path, "w") as fh:
+                fh.write(build_srec([(addr, data)], header="PICOBDM-DUMP"))
+            resp["saved"] = path
+        return jsonify(resp)
+    except (BdmClientError, ValueError) as e:
+        return api_error(e)
+
+
+def _verify_chunks(chunks, max_report=64):
+    """Read each chunk back and diff it. Call inside a transaction."""
+    mismatches = []
+    total = 0
+    checked = 0
+    for addr, expect in chunks:
+        actual = _dump_region(addr, len(expect))
+        checked += len(expect)
+        for i, (e, a) in enumerate(zip(expect, actual)):
+            if e != a:
+                total += 1
+                if len(mismatches) < max_report:
+                    mismatches.append(
+                        {"addr": addr + i, "expected": e, "actual": a}
+                    )
+    return {"bytes_checked": checked, "mismatches": mismatches,
+            "mismatch_count": total, "match": total == 0,
+            "truncated": total > len(mismatches)}
+
+
+@app.route("/api/verify", methods=["POST"])
+def api_verify():
+    """Standalone read-back-and-compare. Works right after programming, and
+    just as well months later to answer "did this chip's contents change".
+
+    Two request forms:
+      multipart/form-data with 'file' = an .s19      (compares every record)
+      application/json {"addr":57344,"hex":"8b899e"} (compares a byte run)
+
+    -> {"ok":true,"match":false,"bytes_checked":195,"mismatch_count":2,
+        "truncated":false,
+        "mismatches":[{"addr":57345,"expected":137,"actual":255}, ...],
+        "chunks":[{"addr":57344,"len":192}, ...]}
+
+    `match` is the answer; `mismatches` is capped at 64 entries with
+    `mismatch_count` giving the true total, so a blank chip compared against
+    a full image reports usefully instead of returning 8192 rows.
+    """
+    try:
+        if "file" in request.files:
+            try:
+                text = request.files["file"].read().decode()
+            except UnicodeDecodeError:
+                return api_error("uploaded file is not text -- expected an "
+                                 "S-record file")
+            chunks = merge_contiguous(parse_srec(text))
+            if not chunks:
+                return api_error("no data records found in file")
+        else:
+            body = json_body()
+            addr = addr_arg(body["addr"])
+            hexstr = str(body["hex"]).strip().replace(" ", "")
+            try:
+                data = bytes.fromhex(hexstr)
+            except ValueError:
+                return api_error("'hex' is not a hex byte string")
+            if not data:
+                return api_error("'hex' is empty")
+            chunks = [(addr, data)]
+        for addr, data in chunks:
+            check_range(addr, "record address", 0, ADDR_MAX)
+            check_range(addr + len(data) - 1, "record end address", 0, ADDR_MAX)
+        with client.transaction():
+            result = _verify_chunks(chunks)
+        return jsonify({
+            "ok": True,
+            "chunks": [{"addr": a, "len": len(d)} for a, d in chunks],
+            **result,
+        })
     except (BdmClientError, KeyError, ValueError) as e:
         return api_error(e)
 

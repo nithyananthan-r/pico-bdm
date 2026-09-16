@@ -167,6 +167,53 @@ FCMD_MASS_ERASE   = 0x41
 
 PAGE_SIZE = 512  # bytes, per SG8/SG4 FLASH organization
 
+# ---------------------------------------------------------------------------
+# Chip security (NVOPT / FOPT), and the hazard that goes with it.
+#
+# NVOPT lives at $FFBF -- inside the LAST FLASH PAGE, $FE00-$FFFF, the same
+# page as the reset vector. Erasing that page blanks NVOPT to 0xFF, i.e.
+# SEC01:SEC00 = 1:1 = SECURED, and the part latches security from NVOPT at
+# every reset. So an erase of page $FE00 that is not followed by
+# reprogramming $FFBF *in the same power cycle* locks the chip at the next
+# power-up. Measured, and recovered from, in the TENTH session
+# (CONTEXT.md Finding 95).
+#
+# FOPT ($1821) is the RUNTIME copy: loaded from NVOPT at reset, but updated
+# in place by the unsecure logic, which makes it the witness for "did the
+# unsecure actually take" within a power cycle (Finding 96).
+#
+# SEC01:SEC00 = 1:0 is the ONLY unsecured encoding; 0:0, 0:1 and 1:1 all
+# mean secured.
+#
+# NVOPT_SECURED is 0xFC and not 0xFF on purpose: FLASH programming can only
+# drive bits 1 -> 0, so from the unsecured 0xFE the only security state
+# reachable WITHOUT erasing page $FE00 (and therefore without opening the
+# Finding 95 window) is SEC = 0:0. Same lock, no hazard.
+# ---------------------------------------------------------------------------
+ADDR_NVOPT = 0xFFBF
+NVOPT_PAGE = 0xFE00
+NVOPT_UNSECURED = 0xFE       # KEYEN=1 FNORED=1 SEC=1:0
+NVOPT_SECURED = 0xFC         # KEYEN=1 FNORED=1 SEC=0:0
+SEC_MASK = 0x03
+SEC_UNSECURED = 0x02
+
+# System / identity registers used by chip_info() and the live panel.
+REG_SRS    = 0x1800
+REG_SOPT1  = 0x1802
+REG_SDIDH  = 0x1806
+REG_SDIDL  = 0x1807
+REG_SPMSC1 = 0x1809
+
+# Direct-page port registers (MC9S08SG8 register map). PTA/PTB are bonded
+# out on this package; PTC is read anyway and reported raw, flagged as
+# possibly-absent rather than silently presented as real pin state.
+REG_PTAD  = 0x0000
+REG_PTADD = 0x0001
+REG_PTBD  = 0x0002
+REG_PTBDD = 0x0003
+REG_PTCD  = 0x0004
+REG_PTCDD = 0x0005
+
 # fFCLK must land in 150-200 kHz (datasheet §4.7.1). Aim for the middle of
 # that window rather than its exact upper edge, so rounding and a slightly
 # off nominal bus clock can't push us out of spec.
@@ -2030,14 +2077,40 @@ class Bdc:
         "SP":  (CMD_READ_SP, CMD_WRITE_SP, True),
     }
 
-    def read_reg(self, name):
+    def read_reg(self, name, delay=0, double=True):
+        """Read a CPU register. *** THESE WORK. Finding 93 was wrong. ***
+
+        Two things had to be right at once, and the ELEVENTH session found
+        both (CONTEXT.md Finding 103):
+
+        1. `delay=0`, not 1. Table 17-1 writes these as `68/d/RD`, but on
+           this part the answer is in the FIRST marker slot, exactly like
+           READ_STATUS. Sampling the second slot returns the pull-up, which
+           is what made every register look dead: A/CCR/HX/PC/SP all read
+           0xFF/0xFFFF and that was recorded as "active-BDM commands are
+           silent on this part".
+
+        2. Issue the read TWICE and keep the second answer. A and the H
+           half of H:X are loaded into the BDC shift register as the
+           command COMPLETES, so the first read clocks out the previous
+           transaction's leftovers and the second clocks out the real
+           value. Measured: write A=5A,A5,3C,00,F0 and the first read
+           returns the previous write every time while the second returns
+           the current one. CCR, PC, SP and the X half are already correct
+           on the first read and are unaffected by reading again (they are
+           pure reads with no side effects), so this is done unconditionally
+           rather than per-register.
+
+        Pass double=False / delay=1 to reproduce the old behaviour.
+        """
         try:
             read_op, _, is_word = self._CPU_REGS[name]
         except KeyError:
             raise BdcError("unknown register: %r" % name)
-        # 68/d/RD, 69/d/RD, 6B/d/RD16, 6C/d/RD16, 6F/d/RD16 -- every CPU
-        # register read carries the delay `d`.
-        return self._xfer_read((read_op,), 2 if is_word else 1, delay=1)
+        nread = 2 if is_word else 1
+        if double:
+            self._xfer_read((read_op,), nread, delay=delay)
+        return self._xfer_read((read_op,), nread, delay=delay)
 
     def write_reg(self, name, value):
         try:
@@ -2225,3 +2298,586 @@ class Bdc:
             raise BdcError("verification failed after flash_write_region")
 
         return len(data)
+
+    # -- page-at-a-time programming, security, and state reporting ---------
+    #
+    # Everything below runs ENTIRELY ON THE PICO on purpose. A host-driven
+    # byte over the JSON protocol costs ~17 ms of USB round trip (Finding
+    # 90/94), so a 195-byte image driven from Python would be ~30 s of pure
+    # latency and a 12-register status poll would take a fifth of a second.
+    # On the Pico a BDC byte is ~3 ms, so these are one round trip each.
+
+    def _security_from_fopt(self, fopt):
+        sec = fopt & SEC_MASK
+        return {
+            "fopt": fopt,
+            "sec": sec,
+            "secured": sec != SEC_UNSECURED,
+            "keyen": bool(fopt & 0x80),
+            "fnored": bool(fopt & 0x40),
+            # 0xFF is this project's signature for "the target said nothing
+            # and we read the pull-up". It also decodes as SEC = 1:1, so a
+            # dead link and a secured part look identical here unless the
+            # caller is told to be suspicious.
+            "suspect_link": fopt == 0xFF,
+        }
+
+    def security_state(self):
+        """Current security state, from FOPT ($1821) with NVOPT ($FFBF) as
+        a cross-check.
+
+        FOPT is a peripheral register and answers even on a secured part.
+        NVOPT is FLASH, and on a secured part every FLASH read returns 0x00
+        (Finding 95) -- so `nvopt` is only meaningful when `secured` is
+        False, and `nvopt_trustworthy` says so explicitly instead of
+        handing back a 0x00 that looks like data.
+        """
+        st = self._security_from_fopt(self.read_byte(REG_FOPT))
+        st["nvopt"] = self.read_byte(ADDR_NVOPT)
+        st["nvopt_trustworthy"] = not st["secured"]
+        return st
+
+    def set_security(self, nvopt_value=NVOPT_SECURED, bus_freq_hz=None):
+        """Program NVOPT ($FFBF) to lock the part at the next reset.
+
+        Refuses any value that would need a 1 -> 0 -> 1 transition, because
+        FLASH programming cannot set a bit: that would require erasing page
+        $FE00, which is the Finding 95 hazard. From the usual unsecured
+        0xFE, the reachable secured value is 0xFC (SEC = 0:0).
+
+        Security is latched AT RESET, so this does not lock the current
+        power cycle -- the caller still has the link until the next
+        power-on.
+        """
+        if bus_freq_hz:
+            self.flash_init_clock(bus_freq_hz)
+        self.flash_unprotect()
+        before = self.read_byte(ADDR_NVOPT)
+        nvopt_value &= 0xFF
+        if (before & nvopt_value) != nvopt_value:
+            raise BdcError(
+                "cannot program $FFBF from 0x%02X to 0x%02X: FLASH "
+                "programming only clears bits (1->0). Erasing page $FE00 "
+                "would be needed, which blanks NVOPT -- see Finding 95."
+                % (before, nvopt_value)
+            )
+        self.flash_program_byte(ADDR_NVOPT, nvopt_value)
+        after = self.read_byte(ADDR_NVOPT)
+        st = self._security_from_fopt(self.read_byte(REG_FOPT))
+        return {
+            "before": before,
+            "wrote": nvopt_value,
+            "after": after,
+            "written": after == nvopt_value,
+            # FOPT still shows the state latched at the last reset; the new
+            # NVOPT only takes effect at the next one.
+            "fopt_now": st["fopt"],
+            "secured_now": st["secured"],
+            "takes_effect": "at the next reset / power cycle",
+        }
+
+    def flash_unsecure(self, bus_freq_hz=None, restore_nvopt=NVOPT_UNSECURED,
+                       probe_addr=0xE000):
+        """Full wipe + unsecure, the Finding 96 recipe, step by step.
+
+        *** MASS ERASE ALONE DOES NOT UNSECURE AN HCS08. *** It is the
+        blank check (erase-verify, FCMD 0x05) that releases security --
+        measured, on a really-secured part, in the TENTH session. This runs
+        both and reports every step separately so a failure is attributable
+        rather than a black box.
+
+        Returns a report dict; it does NOT raise, so the caller always gets
+        the steps that did complete.
+        """
+        rep = {"steps": [], "secured_before": None, "secured_after": None,
+               "complete": False, "error": None, "erased": False}
+
+        def add(name, ok, **detail):
+            entry = {"step": name, "ok": bool(ok)}
+            entry.update(detail)
+            rep["steps"].append(entry)
+            return entry
+
+        try:
+            before = self.security_state()
+            rep["secured_before"] = before["secured"]
+            add("read_security", True, fopt=before["fopt"], sec=before["sec"],
+                secured=before["secured"], suspect_link=before["suspect_link"])
+
+            if bus_freq_hz:
+                self.flash_init_clock(bus_freq_hz)
+                add("flash_init_clock", True, bus_freq_hz=int(bus_freq_hz),
+                    fcdiv=self.read_byte(REG_FCDIV))
+
+            self.flash_mass_erase()
+            rep["erased"] = True
+            add("mass_erase", True, fstat=self.read_byte(REG_FSTAT),
+                fopt=self.read_byte(REG_FOPT))
+
+            blank = self.flash_blank_check()
+            st = self.security_state()
+            add("blank_check", blank, blank=blank,
+                fstat=self.read_byte(REG_FSTAT), fopt=st["fopt"],
+                secured=st["secured"])
+            if not blank:
+                raise BdcError(
+                    "blank check reported NOT blank after a mass erase -- "
+                    "the erase did not take"
+                )
+
+            probe = self.read_byte(probe_addr)
+            add("flash_readable", probe == 0xFF, addr=probe_addr, value=probe,
+                note="a secured part reads 0x00 everywhere in FLASH")
+            if probe != 0xFF:
+                raise BdcError(
+                    "FLASH at $%04X reads 0x%02X after erase+blank check; "
+                    "expected 0xFF on an erased, unsecured part"
+                    % (probe_addr, probe)
+                )
+
+            st = self.security_state()
+            add("security_released", not st["secured"], fopt=st["fopt"],
+                sec=st["sec"], secured=st["secured"])
+
+            if restore_nvopt is not None:
+                # The part is unsecured RIGHT NOW but NVOPT is blank (0xFF =
+                # SEC 1:1), so it would re-secure itself at the next reset.
+                # Closing that window is part of the operation, not an
+                # optional extra.
+                self.flash_program_byte(ADDR_NVOPT, restore_nvopt)
+                rb = self.read_byte(ADDR_NVOPT)
+                add("restore_nvopt", rb == restore_nvopt,
+                    wrote=restore_nvopt, read=rb,
+                    note="without this the part re-secures at the next reset")
+                if rb != restore_nvopt:
+                    raise BdcError(
+                        "NVOPT restore did not verify: wrote 0x%02X, read "
+                        "0x%02X -- THE PART WILL RE-SECURE AT THE NEXT RESET"
+                        % (restore_nvopt, rb)
+                    )
+
+            final = self.security_state()
+            rep["secured_after"] = final["secured"]
+            rep["complete"] = not final["secured"]
+        except Exception as e:                     # report, don't propagate
+            rep["error"] = "%s: %s" % (type(e).__name__, e)
+            try:
+                final = self.security_state()
+                rep["secured_after"] = final["secured"]
+            except Exception:
+                pass
+        return rep
+
+    def flash_program_image(self, chunks, bus_freq_hz=None, erase=True,
+                            nvopt=NVOPT_UNSECURED, verify=True):
+        """Program a whole image PAGE AT A TIME: erase -> program -> verify
+        one page before touching the next.
+
+        `chunks` is a list of (addr, bytes). They may overlap pages and be
+        non-contiguous; this builds the page map itself, so the "chunk B's
+        erase wipes chunk A" hazard that /api/flash_srec works around by
+        pre-computing a page union cannot arise here at all.
+
+        Why page at a time: a failure (or a power loss) then leaves a known
+        state -- "pages 0..N-1 are erased, programmed and verified, page N
+        failed at address X" -- instead of a half-written array nobody can
+        characterise. This is the achievable form of power-loss protection
+        on this hardware; there is no VDD sense wire to interrupt on.
+
+        Page $FE00 gets special handling: erasing it blanks NVOPT at $FFBF
+        and the part re-secures at the next reset (Finding 95). So NVOPT is
+        reprogrammed IMMEDIATELY after that page's erase, before any other
+        byte of it, and `security_risk` stays True for exactly that window.
+        If the report comes back with security_risk True, the part is one
+        reset away from locking itself.
+
+        Returns a report dict; does NOT raise.
+        """
+        rep = {"pages": [], "bytes_written": 0, "complete": False,
+               "error": None, "security_risk": False, "nvopt": None,
+               "pages_total": 0}
+
+        # page -> {addr: byte}
+        pages = {}
+        for addr, data in chunks:
+            for i in range(len(data)):
+                a = addr + i
+                page = a - (a % PAGE_SIZE)
+                cells = pages.get(page)
+                if cells is None:
+                    cells = pages[page] = {}
+                cells[a] = data[i]
+        order = sorted(pages)
+        rep["pages_total"] = len(order)
+
+        # If the image itself carries NVOPT, that value wins; otherwise the
+        # caller's (default: keep the part unsecured).
+        nvopt_value = pages.get(NVOPT_PAGE, {}).get(ADDR_NVOPT, nvopt)
+        rep["nvopt"] = nvopt_value
+
+        try:
+            if bus_freq_hz:
+                self.flash_init_clock(bus_freq_hz)
+            self.flash_unprotect()
+
+            for page in order:
+                cells = pages[page]
+                entry = {"page": page, "bytes": len(cells), "erased": False,
+                         "programmed": 0, "verified": False}
+                rep["pages"].append(entry)
+
+                if erase:
+                    if page == NVOPT_PAGE:
+                        rep["security_risk"] = True
+                    self.flash_erase_page(page)
+                    entry["erased"] = True
+                    if page == NVOPT_PAGE:
+                        self.flash_program_byte(ADDR_NVOPT, nvopt_value)
+                        rb = self.read_byte(ADDR_NVOPT)
+                        entry["nvopt_restored"] = rb
+                        if rb != nvopt_value:
+                            raise BdcError(
+                                "NVOPT restore after erasing page $FE00 did "
+                                "not verify (wrote 0x%02X, read 0x%02X)"
+                                % (nvopt_value, rb)
+                            )
+                        rep["security_risk"] = False
+
+                for a in sorted(cells):
+                    if erase and page == NVOPT_PAGE and a == ADDR_NVOPT:
+                        # already programmed, above, as part of closing the
+                        # hazard window -- and it cannot be programmed twice
+                        continue
+                    self.flash_program_byte(a, cells[a])
+                    entry["programmed"] += 1
+
+                if verify:
+                    bad = []
+                    for a in sorted(cells):
+                        v = self.read_byte(a)
+                        if v != cells[a]:
+                            bad.append([a, cells[a], v])
+                            if len(bad) >= 8:
+                                break
+                    if bad:
+                        entry["mismatches"] = bad
+                        raise BdcError(
+                            "page $%04X failed verify: $%04X wrote 0x%02X "
+                            "read 0x%02X (%d mismatch(es) shown)"
+                            % (page, bad[0][0], bad[0][1], bad[0][2], len(bad))
+                        )
+                    entry["verified"] = True
+
+                rep["bytes_written"] += len(cells)
+            rep["complete"] = True
+        except Exception as e:
+            rep["error"] = "%s: %s" % (type(e).__name__, e)
+        return rep
+
+    # SDID -> what part this is. SDIDH[7:4] is the mask revision and
+    # SDIDH[3:0]:SDIDL is a 12-bit part ID, which identifies the FAMILY,
+    # not the exact derivative: the SG8 and the SG4 share one datasheet and
+    # (measured, this session) one ID. Telling them apart needs a probe, so
+    # `identify()` does one instead of guessing -- see Finding 92, where
+    # working RAM at $0240 was the first positive identification of which of
+    # the two chips was in the socket.
+    _PART_IDS = {
+        0x014: {
+            "family": "MC9S08SG8 / MC9S08SG4 (HCS08 SG family)",
+            "variants": ["MC9S08SG8", "MC9S08SG4"],
+        },
+    }
+
+    def _ram_cell_ok(self, addr, patterns=(0x5A, 0xA5)):
+        """Non-destructive 'does this RAM cell exist and hold data' test.
+
+        Two different patterns, because one pattern cannot tell a real cell
+        from a bus that happens to float to that value -- and this die has
+        cells that hold SOME bits (the $0060-$006F defect), which a single
+        0xFF write would misreport. The original byte is put back.
+        """
+        orig = self.read_byte(addr)
+        ok = True
+        for p in patterns:
+            self.write_byte(addr, p)
+            if self.read_byte(addr) != p:
+                ok = False
+                break
+        self.write_byte(addr, orig)
+        return ok
+
+    def identify(self, ram_probe=True, defect_scan=False):
+        """Identify the MCU: decode SDID, and (optionally) probe for the
+        facts that SDID cannot give.
+
+        `ram_probe` writes and restores ONE RAM byte ($0240). That is safe
+        on a halted target and is how SG8 (512 B RAM) is told from SG4
+        (256 B, no $0240). It does perturb RAM for a heartbeat, so it is a
+        parameter, not a default of every status read.
+
+        `defect_scan` walks $0060-$006F and reports the per-address AND mask
+        this particular die imposes (Finding 92). Also restores every byte.
+        """
+        sdidh = self.read_byte(REG_SDIDH)
+        sdidl = self.read_byte(REG_SDIDL)
+        part_id = ((sdidh & 0x0F) << 8) | sdidl
+        ent = self._PART_IDS.get(part_id)
+        out = {
+            "sdidh": sdidh, "sdidl": sdidl,
+            "part_id": part_id, "part_id_hex": "0x%03X" % part_id,
+            "rev": (sdidh >> 4) & 0x0F,
+            "family": ent["family"] if ent else "unknown (SDID 0x%03X)" % part_id,
+            "variants": ent["variants"] if ent else [],
+            "name": None,
+            "confidence": "id-only",
+            "evidence": None,
+            "flash_kb": None, "ram_bytes": None, "flash_start": None,
+        }
+        if sdidh == 0xFF and sdidl == 0xFF:
+            out["family"] = "no answer -- the link read the idle pull-up"
+            out["confidence"] = "none"
+            return out
+        if ent and len(ent["variants"]) == 1:
+            out["name"] = ent["variants"][0]
+
+        if ram_probe and part_id == 0x014:
+            big = self._ram_cell_ok(0x0240)
+            out["name"] = "MC9S08SG8" if big else "MC9S08SG4"
+            out["confidence"] = "probed"
+            out["ram_bytes"] = 512 if big else 256
+            out["flash_kb"] = 8 if big else 4
+            out["flash_start"] = 0xE000 if big else 0xF000
+            out["evidence"] = (
+                "RAM at $0240 holds written data, so this part has the SG8's "
+                "512 B array" if big else
+                "RAM at $0240 does not hold written data, so this is the "
+                "SG4's 256 B array"
+            )
+
+        if defect_scan:
+            bad = []
+            for a in range(0x0060, 0x0070):
+                orig = self.read_byte(a)
+                self.write_byte(a, 0xFF)
+                mask = self.read_byte(a)
+                self.write_byte(a, orig)
+                if mask != 0xFF:
+                    bad.append({"addr": a, "mask": mask})
+            out["bad_ram_cells"] = bad
+            out["bad_ram_note"] = (
+                "cells that do not return 0xFF after 0xFF is written: a "
+                "fixed per-address AND mask, localised to this die "
+                "(CONTEXT.md Finding 92). Avoid this range."
+            )
+        return out
+
+    def chip_info(self, bus_freq_hz=None, blank_check=False):
+        """Everything cheap and already-proven-readable about the part in
+        the socket, in ONE round trip. Meant to run on connect."""
+        info = {}
+        info["bdcscr"] = self.read_status()
+        sdidh = self.read_byte(REG_SDIDH)
+        sdidl = self.read_byte(REG_SDIDL)
+        info["sdidh"] = sdidh
+        info["sdidl"] = sdidl
+        # SDIDH[3:0]:SDIDL = 12-bit part ID; SDIDH[7:4] = mask set revision.
+        info["part_id"] = ((sdidh & 0x0F) << 8) | sdidl
+        info["rev"] = (sdidh >> 4) & 0x0F
+        info["id_ok"] = (sdidl == 0x14 and (sdidh & 0x0F) == 0x00)
+
+        srs = self.read_byte(REG_SRS)
+        info["srs"] = srs
+        info["reset_source"] = {
+            "por": bool(srs & 0x80), "pin": bool(srs & 0x40),
+            "cop": bool(srs & 0x20), "ilop": bool(srs & 0x10),
+            "ilad": bool(srs & 0x08), "lvd": bool(srs & 0x02),
+        }
+        info["sopt1"] = self.read_byte(REG_SOPT1)
+        info["spmsc1"] = self.read_byte(REG_SPMSC1)
+        info["fcdiv"] = self.read_byte(REG_FCDIV)
+        info["fprot"] = self.read_byte(REG_FPROT)
+        info["fstat"] = self.read_byte(REG_FSTAT)
+        info["security"] = self.security_state()
+        info["bdc_clock_hz"] = self.target_freq_hz
+        # CLKSW = 1 selects the MCU bus clock as the BDC clock, so the rate
+        # sync() measured IS fBus on this part (Finding 94).
+        info["clksw"] = bool(info["bdcscr"] & SCR_CLKSW)
+        info["bus_clock_hz"] = self.target_freq_hz if info["clksw"] else None
+
+        if blank_check:
+            try:
+                if bus_freq_hz:
+                    self.flash_init_clock(bus_freq_hz)
+                info["blank"] = self.flash_blank_check()
+            except Exception as e:
+                info["blank"] = None
+                info["blank_error"] = "%s: %s" % (type(e).__name__, e)
+        return info
+
+    def relink(self, validate_addr=REG_SDIDL, expect=0x14):
+        """Re-establish the BDC link WITHOUT power-cycling the target.
+
+        `/api/sync` enters BDM with a power-on reset, which is the only
+        entry this part accepts (Finding 63) -- but it also resets the CPU,
+        so it cannot be used to recover a link to a target that is RUNNING
+        without destroying what it was doing. This does the two things that
+        actually matter for a running target, from Findings 99 and 100:
+
+          1. SYNC measures 2x high against a free-running target, so try
+             the measured rate AND half of it, validating each by reading a
+             register with a known value (SDIDL = 0x14).
+          2. Memory reads are non-intrusive but still need BDM ENABLED:
+             set ENBDM (preserving CLKSW, which must stay as sync()
+             calibrated it) before believing a read.
+
+        Nothing here halts the CPU. Returns what it settled on.
+        """
+        raw = self.sync()
+        out = {"sync_raw_hz": raw, "bit_clock_hz": None, "validated": False,
+               "status": None, "tried": []}
+        for cand in (raw, raw / 2):
+            try:
+                self.set_bit_clock(cand)
+                self.update_control(set_bits=SCR_ENBDM)
+                self.set_bit_clock(cand)
+                v = self.read_byte(validate_addr)
+                st = self.read_status()
+            except Exception as e:
+                out["tried"].append({"hz": int(cand), "error": str(e)})
+                continue
+            out["tried"].append({"hz": int(cand), "value": v, "status": st})
+            if v == expect:
+                out["bit_clock_hz"] = int(cand)
+                out["validated"] = True
+                out["status"] = st
+                return out
+        return out
+
+    def power_state(self):
+        """What the programmer knows about target power — which is what it
+        is COMMANDING, not what it is measuring.
+
+        There is no voltage sense on this wiring and none can be added
+        without a wire: target VDD is driven from GPIO12, and the RP2040's
+        ADC only reaches GPIO26-29. So `can_sense_voltage` is False and says
+        why, rather than the UI inventing a rail voltage. The honest in-band
+        witness that VDD is actually present is that the target answers BDC
+        commands at all — R1 (10k, BKGD -> VDD) idles BKGD high only while
+        the target is powered.
+        """
+        return {
+            "vdd_pin": self.power_pin_num,
+            "vdd_driven_high": None if self.power is None else bool(self.power.value()),
+            "bkgd_pin": self.bkgd_pin_num,
+            "reset_pin": self.reset_pin_num,
+            "can_sense_voltage": False,
+            "reason": "target VDD is driven from GPIO%s, which is not an "
+                      "ADC-capable pin (the RP2040 ADC reaches GPIO26-29 "
+                      "only), and no sense wire exists"
+                      % self.power_pin_num,
+            "adc_capable_pins": [26, 27, 28, 29],
+            "witness": "a target that answers BDC commands is powered; that "
+                       "is the only in-band evidence available",
+        }
+
+    def live_state(self, cpu_regs=True, ports=True):
+        """One-round-trip snapshot for a live-debug panel.
+
+        Honesty rule for the CPU registers: they DO answer now (Finding
+        103 -- delay=0 plus a double read), but the all-ones pattern is
+        still exactly what a dead link returns, so a register reading
+        0xFF/0xFFFF is flagged `ambiguous` with a reason rather than
+        presented as a confident value. Anything else is real and is
+        reported as such.
+        """
+        out = {"link_ok": True, "link_error": None}
+        s = self.read_status()
+        if s == 0xFF:
+            # Every bit set is this project's signature for "nobody drove
+            # the line". A running target can drift out of sync (Findings
+            # 99/100), and a panel that then rendered 0xFF as register
+            # contents would be inventing state. Say so and stop; relink()
+            # is the non-destructive recovery.
+            out["link_ok"] = False
+            out["link_error"] = (
+                "BDCSCR read back 0xFF -- the target is not answering at the "
+                "current bit rate. If it is running, re-establish with "
+                "relink() (SYNC can read 2x high against a free-running "
+                "target, and ENBDM must be set); a halted target needs a "
+                "power-on re-entry."
+            )
+            out["bdcscr"] = {"value": s}
+            return out
+        out["bdcscr"] = {
+            "value": s,
+            "enbdm": bool(s & SCR_ENBDM), "bdmact": bool(s & SCR_BDMACT),
+            "bkpten": bool(s & SCR_BKPTEN), "fts": bool(s & SCR_FTS),
+            "clksw": bool(s & SCR_CLKSW), "ws": bool(s & SCR_WS),
+            "wsf": bool(s & SCR_WSF), "dvf": bool(s & SCR_DVF),
+        }
+        # BDMACT is the single fact a panel needs most: halted in background
+        # mode (registers meaningful, FLASH commands allowed) vs executing
+        # (memory reads still work, CPU registers do not).
+        out["halted"] = bool(s & SCR_BDMACT)
+        # From here on a read can legitimately fail mid-poll against a
+        # RUNNING target (a DVF, or the rate drifting out from under us).
+        # That is a link fact, not a crash: mark the snapshot and return
+        # what was gathered, so a polling UI degrades instead of erroring.
+        try:
+            out["bkpt"] = {
+                "addr": self.read_bkpt(),
+                "enabled": bool(s & SCR_BKPTEN),
+                "tag_mode": bool(s & SCR_FTS),
+            }
+
+            if ports:
+                out["ports"] = {
+                    "ptad": self.read_byte(REG_PTAD),
+                    "ptadd": self.read_byte(REG_PTADD),
+                    "ptbd": self.read_byte(REG_PTBD),
+                    "ptbdd": self.read_byte(REG_PTBDD),
+                    "ptcd": self.read_byte(REG_PTCD),
+                    "ptcdd": self.read_byte(REG_PTCDD),
+                }
+        except Exception as e:
+            out["link_ok"] = False
+            out["link_error"] = "%s: %s" % (type(e).__name__, e)
+            return out
+
+        if cpu_regs:
+            regs = {}
+            halted = out["halted"]
+            for name in ("A", "CCR", "PC", "HX", "SP"):
+                is_word = self._CPU_REGS[name][2]
+                idle = 0xFFFF if is_word else 0xFF
+                if not halted:
+                    # The CPU is EXECUTING. A register read still returns
+                    # bytes -- measured against the running blinky, PC came
+                    # back as a different meaningless value every poll
+                    # (0x9C00, 0x4D00, 0xCB00 ...) -- but the register is
+                    # changing under the read and there is no defined
+                    # answer. Report that instead of animating noise.
+                    regs[name] = {
+                        "available": False, "value": None, "raw": None,
+                        "ambiguous": False,
+                        "reason": "the target is running (BDCSCR.BDMACT=0); "
+                                  "CPU registers only have a defined value "
+                                  "while it is halted in background mode",
+                    }
+                    continue
+                try:
+                    raw = self.read_reg(name)
+                except Exception as e:
+                    regs[name] = {"available": False, "value": None,
+                                  "raw": None, "ambiguous": False,
+                                  "reason": "%s: %s" % (type(e).__name__, e)}
+                    continue
+                regs[name] = {
+                    "available": True, "value": raw, "raw": raw,
+                    "ambiguous": raw == idle,
+                    "reason": ("all-ones is also what a silent link returns, "
+                               "so this particular value cannot be told apart "
+                               "from 'no answer'") if raw == idle else None,
+                }
+            out["cpu_regs"] = regs
+        return out

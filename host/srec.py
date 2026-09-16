@@ -96,6 +96,34 @@ def parse_srec(text):
     return chunks
 
 
+def build_srec(chunks, header="PICOBDM", bytes_per_record=32):
+    """Encode (addr, bytes) chunks as S1 records -- the inverse of
+    parse_srec, used to save a chip read-back as a re-flashable .s19.
+
+    S1 (16-bit addresses) throughout, because this part's whole address
+    space is 16-bit; an S0 header and an S9 terminator bracket the data so
+    the result loads in any standard tool (and in parse_srec, which skips
+    both).
+    """
+    lines = []
+
+    def emit(rectype, addr, addr_len, data):
+        count = addr_len + len(data) + 1
+        raw = bytearray([count])
+        raw += addr.to_bytes(addr_len, "big")
+        raw += data
+        raw.append((~sum(raw)) & 0xFF)
+        lines.append("S%s%s" % (rectype, raw.hex().upper()))
+
+    emit("0", 0x0000, 2, header.encode()[:32])
+    for addr, data in chunks:
+        for off in range(0, len(data), bytes_per_record):
+            piece = bytes(data[off:off + bytes_per_record])
+            emit("1", addr + off, 2, piece)
+    emit("9", 0x0000, 2, b"")
+    return "\n".join(lines) + "\n"
+
+
 def merge_contiguous(chunks):
     """Merge adjacent (addr, data) chunks into fewer, larger writes."""
     if not chunks:

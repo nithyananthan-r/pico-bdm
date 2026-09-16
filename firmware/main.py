@@ -21,6 +21,27 @@ POWER_GPIO = 12
 
 bdc = Bdc(bkgd_pin=BKGD_GPIO, reset_pin=RESET_GPIO, power_pin=POWER_GPIO)
 
+# ---------------------------------------------------------------------------
+# Debug-only verbs. DEFAULTS OFF AND MUST STAY OFF IN A SHIPPED BUILD.
+#
+# `eval` / `exec` run arbitrary Python on the Pico, which is the same
+# privilege level as the rest of this channel from the *target's* point of
+# view but a much larger one from the *host's*: it turns "a serial port that
+# can program a chip" into "a serial port that can run anything on the
+# programmer". Since this firmware now also sets and clears chip security,
+# that combination is not something to ship on by default.
+#
+# Flip to True (or drop a file named `debug_verbs` on the Pico) only for a
+# debug session, and put it back afterwards.
+# ---------------------------------------------------------------------------
+DEBUG_VERBS = False
+try:
+    import os as _os
+    if "debug_verbs" in _os.listdir():
+        DEBUG_VERBS = True
+except Exception:
+    pass
+
 
 def ok(**fields):
     fields["ok"] = True
@@ -355,29 +376,36 @@ def handle(cmd):
                 resp[extra] = result[extra]
         return resp
 
-    if name == "eval":
-        # DIAGNOSTIC ESCAPE HATCH (added in the TENTH session).
+    if name in ("eval", "exec"):
+        # DIAGNOSTIC ESCAPE HATCH, added in the TENTH session and DISABLED
+        # in the ELEVENTH (CONTEXT.md Finding 102).
         #
-        # Every experiment this project has ever run needed a new JSON
-        # command in this file plus an mpremote redeploy plus a reset --
-        # roughly a minute of turnaround for a one-line question like
-        # "what does bdc.read_reg('SP') say". `eval` evaluates a Python
-        # expression in this module's namespace (so `bdc` is in scope) and
-        # returns its repr as a string, plus the value itself when it is
-        # JSON-serialisable.
+        # It ran an arbitrary Python expression/statement in this module's
+        # namespace, which saved a redeploy-and-reset per one-line question
+        # during the debug sessions. It is off by default now, because this
+        # same JSON channel gained chip-security control: shipping "anyone
+        # who can open the Pico's COM port can run arbitrary code on it"
+        # alongside "this port can lock and wipe a customer's part" is a
+        # contradiction. The serial port is not a privileged channel -- on
+        # Windows any local process can open COM10.
         #
-        # It is only reachable over the local USB serial link, which is
-        # already a full control channel for the target -- anything that
-        # can send JSON here can already erase the chip.
-        expr = cmd["expr"]
-        v = eval(expr)                                  # noqa: S307
-        try:
-            json.dumps(v)
-        except Exception:
-            v = repr(v)
-        return ok(value=v, repr=repr(v))
-
-    if name == "exec":
+        # To re-enable for a debug session: set DEBUG_VERBS = True at the
+        # top of this file (or create a file named `debug_verbs` on the
+        # Pico's filesystem), redeploy, and REMOVE IT AGAIN afterwards.
+        if not DEBUG_VERBS:
+            return err(
+                "%r is disabled in this build -- it executes arbitrary "
+                "Python on the Pico. Set DEBUG_VERBS = True in main.py (or "
+                "create a file named 'debug_verbs' on the Pico) to re-enable "
+                "it for a debug session." % name
+            )
+        if name == "eval":
+            v = eval(cmd["expr"])                       # noqa: S307
+            try:
+                json.dumps(v)
+            except Exception:
+                v = repr(v)
+            return ok(value=v, repr=repr(v))
         exec(cmd["src"], globals())                     # noqa: S102
         return ok()
 
@@ -387,6 +415,63 @@ def handle(cmd):
             cmd["addr"], data, erase_pages=cmd.get("erase_pages", True)
         )
         return ok(bytes_written=n)
+
+    if name == "flash_image":
+        # Page-at-a-time erase/program/verify for a whole image.
+        # {"cmd":"flash_image","chunks":[{"addr":57344,"data_b64":"..."}],
+        #  "bus_freq_hz":9248555,"erase":true,"nvopt":254}
+        chunks = [
+            (int(c["addr"]), binascii.a2b_base64(c["data_b64"]))
+            for c in cmd.get("chunks", [])
+        ]
+        return ok(**bdc.flash_program_image(
+            chunks,
+            bus_freq_hz=cmd.get("bus_freq_hz"),
+            erase=cmd.get("erase", True),
+            nvopt=cmd.get("nvopt", 0xFE),
+            verify=cmd.get("verify", True),
+        ))
+
+    if name == "security":
+        return ok(**bdc.security_state())
+
+    if name == "set_security":
+        return ok(**bdc.set_security(
+            nvopt_value=cmd.get("nvopt", 0xFC),
+            bus_freq_hz=cmd.get("bus_freq_hz"),
+        ))
+
+    if name == "unsecure":
+        # The Finding 96 recovery: mass erase, then the erase-verify that
+        # actually releases security, then restore NVOPT.
+        return ok(**bdc.flash_unsecure(
+            bus_freq_hz=cmd.get("bus_freq_hz"),
+            restore_nvopt=cmd.get("restore_nvopt", 0xFE),
+        ))
+
+    if name == "identify":
+        return ok(**bdc.identify(
+            ram_probe=cmd.get("ram_probe", True),
+            defect_scan=cmd.get("defect_scan", False),
+        ))
+
+    if name == "chip_info":
+        return ok(**bdc.chip_info(
+            bus_freq_hz=cmd.get("bus_freq_hz"),
+            blank_check=cmd.get("blank_check", False),
+        ))
+
+    if name == "relink":
+        return ok(**bdc.relink())
+
+    if name == "power_state":
+        return ok(**bdc.power_state())
+
+    if name == "live_state":
+        return ok(**bdc.live_state(
+            cpu_regs=cmd.get("cpu_regs", True),
+            ports=cmd.get("ports", True),
+        ))
 
     return err("unknown command: %r" % name)
 

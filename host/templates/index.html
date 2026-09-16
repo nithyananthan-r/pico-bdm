@@ -17,6 +17,7 @@
     <span class="subtitle">background debug controller — S08/RS08</span>
   </div>
   <div class="bench-header-right">
+    <span class="readout" id="header-chip">—</span>
     <button id="advanced-toggle" class="link-btn" type="button" aria-pressed="false">Show advanced ▸</button>
     <button id="guide-btn" class="info-btn" type="button" aria-label="how to use this page">i</button>
     <label for="theme-select" class="hint">theme</label>
@@ -36,23 +37,43 @@
       <h2>Using pico-bdm</h2>
       <button id="guide-close-btn" class="info-btn" type="button" aria-label="close guide">x</button>
     </div>
-    <p class="hint">Typical order: <b>Connect</b> → <b>Sync target</b> → <b>Program</b> or read/write memory. Watch the <b>Log</b> panel for what actually happened.</p>
+    <p class="hint">Typical order: <b>Connect</b> → <b>Sync target</b> (the chip identifies itself automatically) → <b>Program</b>, debug, or read/write memory. Watch the <b>Log</b> panel for what actually happened.</p>
     <dl>
       <dt>Connection</dt>
-      <dd>Pick your Pico's serial port (Refresh if it's missing) and click Connect. Once connected, click <b>Sync target</b> to measure the target chip's BDC clock — do this before any read, write, or program. <b>Reset target</b> is a plain RESET pulse (target reboots and runs its own code); <b>Go</b> resumes execution from BDM.</dd>
-      <dt>Flash</dt>
-      <dd>Set the target's bus clock in Hz and pick an erase mode: erase only the pages you're about to write (default), mass-erase the whole chip first, or skip erasing entirely. In "touched pages" mode every page the file touches is erased <i>once, up front</i> — never per-region, because two regions of a real <code>.s19</code> routinely share a 512-byte page and erasing per-region would wipe an already-programmed region. Choose a compiled <code>.s19</code>/<code>.srec</code> file and click Program. Every region is read back and verified by the Pico itself before it reports success, so there is no verify option to turn off. <b>Run target after programming</b> resumes the target's own code once flashing finishes. <b>Blank check</b> asks the FLASH module itself whether the chip is erased. The standalone <b>Mass erase</b> button wipes the whole chip's FLASH on its own — irreversible, used rarely.</dd>
-      <dt>Memory <span class="hint">(under "Show advanced")</span></dt>
-      <dd>Read or write a single byte/block at a given address once synced — useful for peeking at registers or poking test values by hand.</dd>
-      <dt>Registers &amp; breakpoint <span class="hint">(under "Show advanced")</span></dt>
-      <dd>Read/write the CPU's A, CCR, PC, H:X and SP registers directly. <b>Set BKPT</b> writes the BDC breakpoint address <i>and arms it</i> (BDCSCR.BKPTEN=1, force mode) — arming matters, because BDCSCR resets with BKPTEN=0 and the breakpoint register does nothing at all while it's clear. Once armed, resume with <b>Go</b> and the target halts back into BDM when it reaches that address. <b>Tagged GO</b> is <i>not</i> a "run to breakpoint" button: HCS08 parts have no external tag-input pin (HCS08RMv1 §7.3.4.16), so TAGGO behaves exactly like a plain GO here — it's exposed only for completeness. <b>Step</b> single-steps one instruction (TRACE1). <b>BDCSCR</b> is the BDC's own status/control register; Read it first (Write stays disabled until you have, because writing the default 0x00 would clear CLKSW and break the bit timing Sync just calibrated).</dd>
-      <dt>Scope <span class="hint">(under "Show advanced")</span></dt>
-      <dd>Self-capture diagnostic panel that draws the actual BKGD waveform without needing a separate logic analyzer. A second, passive PIO state machine watches the line while the selected operation runs, triggered by the line's first falling edge so Python's imprecise call timing doesn't matter. Enabled and proven on real hardware as of 2026-09-12 — it is what found the protocol bugs recorded in CONTEXT.md. Note that the same Pico both drives and records, so it cannot catch a fault in its own clock; and only the first 128 samples of a fast capture are guaranteed contiguous in time (the PIO RX FIFO is 4 words deep). The raw <code>capture</code> serial command also accepts <code>window_us</code> to zoom out to a whole transaction, and a <code>"command"</code> test to capture an arbitrary BDC command — both well worth using directly, see README.</dd>
-      <dt>Options</dt>
-      <dd>Log display preferences (auto-scroll, timestamps) and the sample count Scope will use once it's re-enabled. Erase and run-after-program options live directly in the Flash panel.</dd>
+      <dd>Pick your Pico's serial port (Refresh if it's missing) and click Connect. Once connected, click <b>Sync target</b> to power-cycle the target into background mode and measure its BDC clock — do this before any read, write, or program. <b>Relink</b> is the other recovery: it re-measures the bit rate and re-asserts ENBDM <i>without</i> resetting the target, so a program that is running keeps running. Use Relink when the live panel says the link was lost; use Sync when you want to start from a known reset.</dd>
+      <dt>Chip</dt>
+      <dd>Fills in automatically after Sync. The part ID (SDID) only identifies the <i>family</i> — the SG8 and SG4 share one ID — so the derivative is settled by probing whether RAM exists at $0240, which is why it says "probed" rather than "id-only". <b>Deep probe</b> additionally scans $0060–$006F for silicon-defective RAM cells on this particular die and runs the FLASH module's own blank check.</dd>
+      <dt>Program</dt>
+      <dd>Set the target's bus clock in Hz and pick an erase mode: erase only the pages you're about to write (default), mass-erase the whole chip first, or skip erasing entirely. Programming is <b>page at a time</b>: erase → program → verify one 512-byte page before the next is touched, so a failure names the page and address it stopped at and every page before it is confirmed good. The memory map animates each page as the target confirms it — nothing is drawn ahead of the hardware. <b>Verify</b> reads the same file back off the chip independently of programming. <b>Dump</b> reads the FLASH array to a timestamped <code>.s19</code> under <code>host/backups/</code>.</dd>
+      <dt>Live state &amp; debugger</dt>
+      <dd>Polls the target a few times a second. Two honesty rules are enforced: CPU registers are shown as <i>unavailable</i> whenever the CPU is running (BDCSCR.BDMACT=0) because the register is changing under the read, and a link that stops answering is shown as <b>LINK LOST</b> rather than rendered as 0xFF data. <b>Halt</b> is the BDC BACKGROUND command, <b>Step</b> is TRACE1, and <b>Set BKPT</b> writes the breakpoint address <i>and arms it</i> (BDCSCR.BKPTEN=1) — arming matters, because BDCSCR resets with BKPTEN=0.</dd>
+      <dt>Memory map</dt>
+      <dd>The target's whole address space. Colours are region type until you press <b>Scan</b>, which reads the chip and recolours each cell by what is actually in it (blank 0xFF vs. programmed). Defective RAM cells are marked from a live scan of this die, never from a hardcoded table — the defect on this board has measurably spread between sessions.</dd>
+      <dt>Security</dt>
+      <dd><b>Lock chip</b> programs NVOPT to set the SEC bits; after the next reset the part refuses all FLASH/RAM access over BDM. <b>Unsecure &amp; wipe</b> is the forgot-passcode recovery: it mass-erases and then runs the FLASH blank check, because on HCS08 a mass erase <i>alone does not release security</i> — the erase-verify does. Both take an automatic backup first (server side, into <code>host/backups/</code>), and both require typing a confirmation word.</dd>
+      <dt>Memory / Registers / Scope <span class="hint">(under "Show advanced")</span></dt>
+      <dd>Byte-level peek and poke, direct register access, and the self-capture scope that draws the actual BKGD waveform without a separate logic analyzer.</dd>
       <dt>Log</dt>
       <dd>Running history of every command sent and its result, newest at the bottom. Clear wipes it.</dd>
     </dl>
+  </div>
+</div>
+
+<!-- Confirmation modal for the two destructive security operations. -->
+<div id="confirm-modal" class="modal-backdrop" hidden>
+  <div class="modal-panel confirm-panel">
+    <div class="modal-header">
+      <h2 id="confirm-title">Confirm</h2>
+      <button id="confirm-close-btn" class="info-btn" type="button" aria-label="cancel">x</button>
+    </div>
+    <div id="confirm-body"></div>
+    <div class="confirm-steps" id="confirm-checklist"></div>
+    <div class="row">
+      <label for="confirm-word">type <b id="confirm-word-label" class="mono"></b></label>
+      <input type="text" id="confirm-word" class="mono" autocomplete="off" spellcheck="false">
+      <button id="confirm-go-btn" class="danger" disabled>Proceed</button>
+      <button id="confirm-cancel-btn">Cancel</button>
+    </div>
   </div>
 </div>
 
@@ -67,17 +88,33 @@
       <button id="disconnect-btn" disabled>Disconnect</button>
     </div>
     <div class="row">
-      <button id="sync-btn" disabled>Sync target</button>
+      <button id="sync-btn" disabled title="power-cycle the target into background mode and calibrate the bit rate — this RESTARTS the target's program">Sync target</button>
+      <button id="relink-btn" disabled title="re-measure the bit rate and re-assert ENBDM WITHOUT resetting the target — use this when the live panel loses the link">Relink</button>
       <span class="readout" id="sync-readout">not synced</span>
     </div>
     <div class="row">
       <button id="reset-target-btn" disabled title="plain RESET pulse — target reboots and runs its own code, does NOT halt into BDM">Reset target</button>
-      <button id="go-btn" disabled title="resume execution (BDC GO)">Go</button>
+      <button id="power-btn" disabled title="what the programmer knows about target power">Power info</button>
+    </div>
+    <div class="readout-block" id="power-readout" hidden></div>
+  </section>
+
+  <section class="module" id="module-chip">
+    <h2>Chip <span class="hint">identified from the socket, not assumed</span></h2>
+    <div class="chip-hero">
+      <div class="chip-name" id="chip-name">—</div>
+      <div class="chip-sub" id="chip-sub">connect and sync to identify the part</div>
+    </div>
+    <div class="fact-grid" id="chip-facts"></div>
+    <div class="row">
+      <button id="identify-btn" disabled title="re-read SDID and probe RAM to settle the derivative">Identify</button>
+      <button id="deep-probe-btn" disabled title="identify + scan this die for defective RAM cells + run the FLASH module's own blank check">Deep probe</button>
+      <span class="hint" id="chip-note"></span>
     </div>
   </section>
 
   <section class="module" id="module-flash">
-    <h2>Flash</h2>
+    <h2>Program <span class="hint">page at a time — erase → program → verify</span></h2>
     <div class="row">
       <label>bus clock (Hz)</label>
       <input type="text" id="bus-freq" value="8000000" class="mono">
@@ -91,17 +128,94 @@
     <div class="row checkbox-row">
       <input type="checkbox" id="opt-run-after">
       <label for="opt-run-after">Run target after programming</label>
-      <span class="hint">every region is read back and verified on the Pico</span>
+      <input type="checkbox" id="opt-live-progress" checked>
+      <label for="opt-live-progress" title="drive the programming page by page from the host so each page's result can be reported as the target confirms it">Live per-page progress</label>
     </div>
     <div class="row">
       <input type="file" id="srec-file" accept=".s19,.s28,.s37,.srec">
       <button id="flash-btn" disabled>Program</button>
+      <button id="verify-btn" disabled title="read the selected file back off the chip and compare — independent of programming">Verify</button>
     </div>
     <div class="row">
-      <button id="mass-erase-btn" class="danger" disabled>Mass erase</button>
+      <button id="dump-btn" disabled title="read the FLASH array to a timestamped .s19 in host/backups/">Dump / backup</button>
       <button id="blank-check-btn" disabled>Blank check</button>
+      <button id="mass-erase-btn" class="danger" disabled>Mass erase</button>
+    </div>
+    <div class="flash-progress" id="flash-progress" hidden>
+      <div class="flash-bar"><div class="flash-bar-fill" id="flash-bar-fill"></div></div>
+      <div class="flash-status" id="flash-status">—</div>
+      <ol class="page-list" id="page-list"></ol>
     </div>
     <pre class="hexdump mono" id="flash-output">—</pre>
+  </section>
+
+  <section class="module" id="module-debug">
+    <h2>Live state &amp; debugger
+      <span class="live-toggle">
+        <span class="hint" id="poll-rate">—</span>
+        <button id="poll-btn" class="link-btn" type="button">Start polling</button>
+      </span>
+    </h2>
+
+    <div class="link-banner" id="link-banner" hidden>
+      <b>LINK LOST</b>
+      <span id="link-banner-msg"></span>
+      <button id="link-relink-btn" class="danger">Relink (keeps the target running)</button>
+    </div>
+
+    <div class="row state-row">
+      <span class="state-pill" id="run-state">idle</span>
+      <span class="readout mono" id="bdcscr-readout">BDCSCR —</span>
+    </div>
+    <div class="bitfield" id="bdcscr-bits"></div>
+
+    <div class="row">
+      <button id="halt-btn" disabled title="BDC BACKGROUND — stop the CPU and enter active background mode without resetting it">Halt</button>
+      <button id="go-btn" disabled title="resume execution (BDC GO)">Go</button>
+      <button id="step-btn" disabled title="single-step one instruction (TRACE1)">Step</button>
+      <button id="tagged-go-btn" disabled title="TAGGO — HCS08 has no external tag-input pin, so this behaves identically to a plain Go">Tagged GO</button>
+    </div>
+    <div class="row">
+      <label>breakpoint</label>
+      <input type="text" id="bkpt-addr" value="0x0000" class="mono">
+      <button id="bkpt-write-btn" disabled title="write the BDC breakpoint address AND arm it (BDCSCR.BKPTEN=1, force mode)">Set BKPT</button>
+      <button id="bkpt-clear-btn" disabled title="disarm the breakpoint (clear BDCSCR.BKPTEN)">Clear</button>
+      <span class="readout mono" id="bkpt-readout">—</span>
+    </div>
+
+    <h3 class="sub">CPU registers <span class="hint" id="regs-note"></span></h3>
+    <div class="reg-grid" id="reg-grid"></div>
+
+    <h3 class="sub">Pins <span class="hint">level is the pin for an input, the driven value for an output</span></h3>
+    <div class="port-grid" id="port-grid"></div>
+  </section>
+
+  <section class="module wide" id="module-memmap">
+    <h2>Memory map
+      <span class="live-toggle">
+        <span class="hint" id="memmap-status">regions only — press Scan to colour cells by what is actually on the chip</span>
+        <button id="memmap-scan-btn" class="link-btn" type="button" disabled>Scan chip</button>
+        <button id="memmap-scanram-btn" class="link-btn" type="button" disabled>Scan RAM only</button>
+      </span>
+    </h2>
+    <div class="map-legend" id="map-legend"></div>
+    <div class="map-body" id="map-body"></div>
+    <div class="map-tip mono" id="map-tip">hover a cell for its address</div>
+  </section>
+
+  <section class="module" id="module-security">
+    <h2>Security &amp; code protect</h2>
+    <div class="sec-hero">
+      <div class="sec-state" id="sec-state">—</div>
+      <div class="hint" id="sec-sub">read the chip to see whether code protection is active</div>
+    </div>
+    <div class="fact-grid" id="sec-facts"></div>
+    <div class="row">
+      <button id="sec-read-btn" disabled>Read security state</button>
+      <button id="sec-lock-btn" class="danger" disabled title="program NVOPT so the part refuses BDM access to FLASH and RAM after the next reset">Lock chip…</button>
+      <button id="sec-wipe-btn" class="danger" disabled title="forgot-passcode recovery: mass erase + erase-verify, which is what actually releases security on HCS08">Unsecure &amp; wipe…</button>
+    </div>
+    <div class="readout-block" id="sec-result" hidden></div>
   </section>
 
   <section class="module" id="module-memory">
@@ -144,7 +258,7 @@
   </section>
 
   <section class="module" id="module-registers">
-    <h2>Registers &amp; breakpoint <span class="hint">(CPU state — requires sync)</span></h2>
+    <h2>Registers &amp; BDCSCR <span class="hint">(direct access — requires sync)</span></h2>
     <div class="row">
       <label>reg</label>
       <select id="reg-select" class="mono">
@@ -160,14 +274,8 @@
       <button id="reg-write-btn" disabled>Write</button>
     </div>
     <div class="row">
-      <label>breakpoint addr</label>
-      <input type="text" id="bkpt-addr" value="0x0000" class="mono">
+      <label>BKPT</label>
       <button id="bkpt-read-btn" disabled>Read BKPT</button>
-      <button id="bkpt-write-btn" disabled title="set the BDC breakpoint address AND arm it (BDCSCR.BKPTEN=1, force mode) — then use Go to run until it is reached">Set BKPT</button>
-      <button id="step-btn" disabled title="single-step one instruction (TRACE1)">Step</button>
-      <button id="tagged-go-btn" disabled title="TAGGO — HCS08 has no external tag-input pin, so this behaves identically to a plain Go; use Set BKPT + Go to stop at an address">Tagged GO</button>
-    </div>
-    <div class="row">
       <label>BDCSCR</label>
       <input type="text" id="control-value" value="0x00" class="mono" style="width:5em">
       <button id="control-read-btn" disabled>Read</button>
@@ -186,6 +294,8 @@
       <label for="opt-timestamps">Log timestamps</label>
     </div>
     <div class="row">
+      <label for="opt-poll-ms">poll interval (ms)</label>
+      <input type="text" id="opt-poll-ms" value="250" class="mono" style="width:5em">
       <label for="opt-sample-count">scope samples</label>
       <input type="text" id="opt-sample-count" value="256" class="mono" style="width:5em">
     </div>

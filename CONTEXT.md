@@ -5017,3 +5017,382 @@ blanks NVOPT at $FFBF and secures the part at the next reset (Finding 95).
 Always reprogram $FFBF = 0xFE in the same power cycle. If it does get
 secured, the recovery is mass erase **followed by an erase-verify** —
 the blank check is what actually releases security (Finding 96).
+
+## ELEVENTH session (2026-09-15) — safety, security, and the registers that were never dead
+
+Backend/API pass on top of the TENTH session's working programmer: power-loss
+-safe programming, chip security set/clear, a real recovery flow, verify,
+dump, chip-info and a pollable live-state feed. No UI in this pass, by
+design — the endpoints are built so the next pass has something concrete to
+draw.
+
+### Finding 102 — the `eval`/`exec` verbs are gone (default-off, not deleted)
+
+The TENTH session added `{"cmd":"eval"}` / `{"cmd":"exec"}` to
+`firmware/main.py` to skip the redeploy-and-reset cycle during debugging.
+They are now behind `DEBUG_VERBS = False` in `main.py` (also settable by
+dropping a file named `debug_verbs` on the Pico's filesystem), and the verbs
+return a refusal explaining how to re-enable them.
+
+The reason is not hypothetical. This same JSON channel now sets and clears
+chip security, and on Windows any local process can open COM10 — so
+"arbitrary Python on the programmer" and "this port locks and wipes parts"
+should not ship in one build. The rest of the protocol is bounded by what
+the BDC can do; `exec` is not bounded by anything.
+
+### Finding 103 — ***THE CPU REGISTERS WORK. Finding 93 WAS WRONG.*** delay=0, and read it twice
+
+Finding 93 recorded A/CCR/HX/PC/SP as address-invariant 0xFF — "every
+active-BDM-only command is silent" — and built a whole theory on the clean
+split between non-intrusive and active-BDM commands. The split was an
+artefact of two bugs in `read_reg`, and both are now fixed and measured.
+
+**Bug 1: the answer is in the FIRST marker slot, not the second.** Table
+17-1 codes these as `68/d/RD`, so `read_reg` passed `delay=1`. Dumping
+every slot of the raw burst with `raw_xfer` (part halted at reset, blinky
+in FLASH):
+
+```
+  A    op 0x68 -> slots 00 FF FF
+  CCR  op 0x69 -> slots 68 FF FF
+  PC   op 0x6B -> slots E0 7B FF
+  HX   op 0x6C -> slots E0 00 FF
+  SP   op 0x6F -> slots 00 FF FF
+  READ_STATUS   -> slots C8 FF FF     (control: known-good command)
+```
+
+Slot 0 is the data; slot 1 is the pull-up `delay=1` was reading. And the
+values are textbook for a part halted at its reset vector: **CCR = 0x68**
+(bits 6:5 read 1, I = 1 — the documented reset CCR), **SP = 0x00FF** (the
+documented reset SP), **PC = 0xE07B**, which is exactly the reset vector
+read back from $FFFE/$FFFF (`e07b`). Three independent right answers at
+once.
+
+**Bug 2: A and the H half of H:X answer one TRANSACTION late.** Write a
+value, read it back, and the first read returns the PREVIOUS one:
+
+```
+   wrote A=0x5A -> reads 00 5A 5A        wrote HX=0xBEEF -> reads F0EF BEEF BEEF
+   wrote A=0xA5 -> reads 5A A5 A5        wrote HX=0x0102 -> reads BE02 0102 0102
+   wrote A=0x3C -> reads A5 3C 3C        wrote HX=0x1234 -> reads 0134 1234 1234
+   wrote A=0x00 -> reads 3C 00 00
+   wrote A=0xF0 -> reads 00 F0 F0        (the F0 leading BEEF's first read is
+                                          the A write before it — one shared
+                                          shift register, one transaction late)
+```
+
+CCR and SP round-trip correctly on the FIRST read (`wrote SP=0x0180 ->
+0180 0180`, `wrote CCR=0x7F -> 7F 7F`), and PC is stable across repeated
+reads. So `read_reg` now issues the read twice and keeps the second answer
+for every register — free for the ones that were already right, since they
+are side-effect-free reads.
+
+**These are writes we chose coming back, not reset values that could be
+coincidence.** A, CCR, HX and SP all round-trip arbitrary data.
+
+**And TRACE1 single-steps the target.** Same session, same link, stepping
+the programmed blinky:
+
+```
+   PC before = 0xE07B
+   after TRACE1 #1  PC = 0xE07E    BDCSCR=0xC8
+   after TRACE1 #2  PC = 0xE07F
+   after TRACE1 #3  PC = 0xE00E     <- a call into the delay routine
+   after TRACE1 #4  PC = 0xE010
+```
+
+Consequences, which are large:
+
+- **"State S" IS textbook active background mode.** Finding 76's open
+  question is answered: the CPU is halted, the registers are live, and
+  single-step works. BDCSCR = 0xC8 (BDMACT = 1) was telling the truth all
+  along.
+- Finding 93's non-intrusive/active-BDM split is retired. It described a
+  host bug, not silicon behaviour.
+- Breakpoints, `GO`, and a real debugger UI are now plausible features
+  rather than blocked ones.
+
+### Finding 104 — a second `/api/connect` to the same port killed the live connection
+
+Hit for real while testing this session's routes, and it would have hit any
+user who clicks Connect twice. Windows gives a COM port to one process
+exclusively, so re-opening the port this app already holds fails with
+`PermissionError(13, 'Access is denied.')`. `connect()` is careful about
+that and leaves the existing handle alone — but `/api/connect`'s error path
+then ran `if client.is_connected: client.disconnect()` and closed the
+perfectly good connection. Everything afterwards answered "not connected to
+a Pico".
+
+Two changes in `host/app.py`:
+
+- A connect to the port already open is now idempotent: it pings and
+  returns `{"ok":true,"already_connected":true}` without reopening.
+- The teardown on failure only runs if *this call* opened the port
+  (`was_connected` captured before the attempt).
+
+Measured after the fix — connect, connect again, then a connect to a port
+that does not exist, with a real read between each:
+
+```
+2. connect COM10 : {'already_connected': False, 'ok': True}
+4. connect AGAIN : {'already_connected': True,  'ok': True}
+6. sync          : 9 248 555 Hz
+8. connect COM99 : ok False, "could not open port 'COM99'"
+9. status        : connected True        <- the live link SURVIVED the failure
+10. read $1807   : 0x14                  <- and still decodes
+```
+
+### Finding 105 — ***THE SECURE / RECOVER CYCLE IS AUTOMATED AND PROVEN.*** Locked the part on purpose, got it back
+
+Finding 96 was a recipe run by hand. This is the same thing as a shipping
+operation (`/api/security` to lock, `/api/unsecure` to recover), driven over
+HTTP, with a power cycle on each side so nothing rests on the same power-up
+that set it.
+
+**Securing without opening the Finding 95 hazard.** FLASH programming only
+drives bits 1 -> 0, so from the unsecured NVOPT = 0xFE the reachable secured
+value is **0xFC (SEC = 0:0)**, not 0xFF (SEC = 1:1) — same lock, and page
+$FE00 is never erased, so there is no window in which a power loss leaves
+the part self-securing. `set_security()` refuses any value needing a 0 -> 1
+bit rather than quietly erasing the page to get there.
+
+```
+POST /api/security {"confirm":"SECURE"}
+   auto-backup first: 8 KB dumped to host/backups/20260916-025450_before-secure_E000-FFFF.s19
+                      (starts 8b899efe05f6af01... = the blinky image)
+   $FFBF  0xFE -> 0xFC   written=true    fopt still 0xC2 (latched at the last reset)
+
+--- power cycle (/api/sync) ---
+   FOPT = 0xC0   SEC = 0:0   secured=true
+   $E000..$E03F  all 0x00                  <- LOCKED, for real
+   SDIDL still 0x14, SRS 0x82, FSTAT 0xC0  <- registers still answer
+```
+
+**Recovering.** And note step 3: the mass erase leaves FOPT at 0xC0, still
+secured. It is the blank check that moves it to 0xC2. Finding 96 reproduced
+exactly, now under automation:
+
+```
+POST /api/unsecure {"confirm":"WIPE"}
+   backup           refused, with the reason: a secured part reads 0x00
+                    everywhere, so there is nothing readable to back up
+   read_security    fopt=0xC0 sec=0 secured=true
+   flash_init_clock fcdiv=0xB4 (bus 9 195 402 Hz)
+   mass_erase       fstat=0xC0  fopt=0xC0     <- STILL SECURED
+   blank_check      blank=true fstat=0xC4 fopt=0xC2 secured=false   <- released here
+   flash_readable   $E000 = 0xFF
+   security_released fopt=0xC2 sec=2
+   restore_nvopt    wrote 0xFE, read 0xFE
+
+--- power cycle (/api/sync) ---
+   FOPT = 0xC2  SEC = 1:0  secured=false
+   $E000.. = FF FF FF ...   RECOVERED, blank and open
+```
+
+One consistency note worth keeping: right after recovery the FLASH module's
+own blank check says **not blank** while a byte-by-byte dump says every byte
+is 0xFF. Both are right — NVOPT = 0xFE is the single programmed byte in the
+array, which is the same thing Finding 95 saw from the other direction.
+
+The guard rails are part of the feature: `/api/security` requires
+`{"confirm":"SECURE"}` and `/api/unsecure` requires `{"confirm":"WIPE"}`,
+and both take an automatic backup first (see Finding 106).
+
+### Finding 106 — "identify the MCU" has to PROBE, and the $0060-$006F defect has spread
+
+`/api/identify` decodes SDID into words instead of hex, but the interesting
+part is what SDID cannot say. Measured:
+
+```
+SDIDH 0xA0  SDIDL 0x14  ->  part_id 0x014, rev 0xA
+                            family "MC9S08SG8 / MC9S08SG4 (HCS08 SG family)"
+                            confidence "id-only", name null
+```
+
+The SG8 and the SG4 share one part ID, so a decoder alone cannot name the
+part in the socket. `ram_probe=1` settles it the way Finding 92 did, by
+writing and restoring one byte:
+
+```
+$0240 holds written data  ->  name "MC9S08SG8", ram_bytes 512, flash_kb 8,
+                              flash_start $E000, confidence "probed"
+(an SG4 would fail that write: 256 B of RAM, no $0240, flash from $F000)
+```
+
+`defect_scan=1` measures this die's bad-cell map rather than trusting the
+one in this file — and that turns out to matter, because **the defect has
+spread since the TENTH session**:
+
+```
+addr                   60 61 62 63 64 65 66 67 68 69 6A 6B 6C 6D 6E 6F
+TENTH session F92      7F 00 00 FF FF 7C FF FF 7C FF FF 00 7F 00 FF 00
+now, scan 1            7F 00 00 FF FF 7C 00 00 7C 00 00 00 7F 00 FF 00
+now, scan 2 (same PC)  7F 00 00 FF FF 7C 00 00 7C 00 00 00 7F 00 FF 00
+now, scan 3 (power cyc)7F 00 00 FF FF 7C 00 00 7C 00 00 00 7F 00 FF 00
+now, scan 4            7F 00 00 FF FF 7C 00 00 7C 00 00 00 7F 00 FF 00
+```
+
+$0066, $0067, $0069 and $006A took arbitrary data perfectly a few hours ago
+and hold nothing now. Four scans across two power cycles agree, so this is
+not measurement noise: the damage in this corner of the die is progressive.
+$0063/$0064/$006E are still perfect. Nothing outside $0060-$006F has ever
+misbehaved.
+
+Consequence for anything built on top: **a memory-map view must scan for bad
+cells, not hard-code Finding 92's table.** That is what this endpoint is
+for.
+
+### Finding 107 — page-at-a-time programming, with the NVOPT window closed automatically
+
+`/api/flash_srec` no longer erases a union of pages up front and then writes
+chunk by chunk. `flash_program_image()` on the Pico builds the page map from
+every chunk and then, per page: **erase -> program -> verify -> next**. A
+failure therefore names the page and the address it died on, and every page
+before it is confirmed good; there is no state where "something was written
+somewhere" is the best available description. That is the honest form of
+power-loss protection on this wiring — VDD is a GPIO with no sense line
+back, so nothing can detect a sag; what can be done is to never have more
+than one page in flight.
+
+The $FE00 hazard is handled inside the same loop: the moment that page is
+erased, NVOPT at $FFBF is reprogrammed, before any other byte of the page,
+and `security_risk` is True for exactly that window. The blinky image
+through the shipping HTTP route:
+
+```
+POST /api/flash_srec  (Project.abs.s19, erase_mode=pages, nvopt=0xFE)
+   1.5 s, 194 bytes
+   page $E000  bytes 192  erased  programmed 192  verified
+   page $FE00  bytes 2    erased  nvopt_restored 0xFE  programmed 2  verified
+   complete true   security_risk false
+
+POST /api/verify  (same file, independent read-back)   match true, 194 bytes
+$FFBF = 0xFE   FOPT = 0xC2 (SEC 1:0, unsecured)   $FFFE/$FFFF = E0 7B
+negative controls $E0C0 $E100 $F000 $FF00 $FFB0 $FFFD  all 0xFF
+```
+
+Note the .s19 itself does NOT contain $FFBF — the TENTH session had to
+append NVOPT by hand to avoid securing the chip (Finding 95, rule 2). That
+manual step is now unnecessary: the guard is in the programming loop.
+
+### Finding 108 — ***GO WORKS TOO.*** The target resumes from BDM, and a running target can be polled
+
+Finding 103 said active BDM is real. GO confirms it from the other side: no
+power cycle, no reset — just `POST /api/go` against a halted, freshly
+programmed part.
+
+```
+before GO   PC = 0xE07B   SOPT1 $1802 = 0xC0   PTADD = 0x00   PTAD = 0x00
+POST /api/go
+after  GO   SOPT1 = 0x00    <- write-once, resets to 0xC0: main() ran
+            PTADD = 0x01    <- the CPU made PTA0 an output
+            PTAD bit0 x40:  0110001100011000111001110011100110001110
+                            16 transitions -- the blink loop, live
+```
+
+Same three fingerprints as Finding 98, but reached by resuming the CPU
+under BDM control rather than by power-cycling with BKGD released.
+
+**Polling a running target.** `/api/live_state` polls it at ~8 Hz with the
+CPU executing: BDCSCR reads 0x89 (ENBDM=1, **BDMACT=0**, CLKSW=1, and DVF
+sets sticky, which is expected when a read lands on a busy bus), and PTAD /
+PTADD track the program.
+
+Two honesty rules came out of it, both now enforced in `live_state()`:
+
+1. **CPU registers are reported unavailable while BDMACT = 0.** They still
+   return bytes — PC came back 0x9C00, 0x4D00, 0xCB00, 0x1A00... a different
+   meaningless value every poll — because the register is moving under the
+   read. A panel animating that would be showing noise as data. Halted, the
+   same field reports PC = 0xE07B with available=true.
+2. **A dead link is reported, not rendered.** If BDCSCR reads 0xFF the
+   snapshot comes back `{"link_ok": false, "link_error": "..."}` instead of
+   0xFF-everything, and any read that throws mid-poll does the same. Seen
+   for real: after a while against the running target, reads started
+   failing with `DVF ... BDCSCR = 0xFF`.
+
+**`/api/relink` is the recovery for that**, and it is not `/api/sync`:
+sync's BDM entry is a power-on reset, which would restart the very program
+you are watching. relink only re-measures the bit rate (trying half, per
+Finding 99), re-asserts ENBDM (Finding 100), and validates by reading
+SDIDL = 0x14. The CPU keeps running throughout.
+
+
+## TWELFTH session (2026-09-16) — the UI, and two things the backend could not do
+
+Frontend pass on top of the ELEVENTH session's endpoints: chip identity,
+live debug, a 2D memory map, real-time programming, and the security /
+wipe flow. Scoped to `host/templates/index.html`, `host/static/app.js`,
+`host/static/style.css` — plus two small, named backend additions that the
+UI genuinely could not be built honestly without (Findings 109 and 110).
+
+### Finding 109 — the Pico answers ONCE per image, so real-time progress had to be driven page by page from the HOST
+
+`flash_program_image()` on the Pico already programs page at a time
+(Finding 107), but it is one serial command: the Pico replies when the
+WHOLE image is done. Measured, that is 1.5 s for the 194-byte blinky and
+would be tens of seconds for a full 8 KB image — a window in which the
+host knows *nothing*. Any "progress bar" drawn during that silence would
+be a timer pretending to be a measurement, which is exactly what this UI
+is not allowed to do.
+
+The fix keeps the firmware untouched. `/api/flash_srec` gained an opt-in
+form field `async=1` which runs the same programming on a worker thread,
+handing firmware **one page's worth of chunks per call** — firmware builds
+its page map from whatever chunks it is given, so one page in means one
+page's erase → program → verify out. Each page's real report is published
+to a new `GET /api/flash_progress` the moment the Pico returns it:
+
+```
+{"state":"running","phase":"page","current_page":57344,"current_index":0,
+ "pages_planned":[{"page":57344,"bytes":192},{"page":65024,"bytes":3}],
+ "pages":[],            <- only pages the TARGET has confirmed
+ "total_bytes":0,"elapsed":0.4}
+```
+
+The invariant the UI relies on: `pages` contains only confirmed pages, and
+a page that is in flight appears as `current_page` and nowhere else. So
+the animation has exactly three honest states per page — planned, on the
+wire, confirmed — and never draws a result the target has not given.
+
+Cost of the split: one extra USB round trip per page (16 for a full 8 KB
+image), which is noise against ~1.6 ms/byte. The synchronous path is
+unchanged and is still the default for scripts.
+
+### Finding 110 — `BACKGROUND` existed in the firmware and had no route
+
+`firmware/main.py` has had `{"cmd":"background"}` since the beginning, and
+`bdm_client.py` had no wrapper for it, so nothing above the firmware could
+*stop* a running target: the app could `go()` and `step()` but the only way
+back to a halt was `/api/sync`, which power-cycles and restarts the
+program you were trying to inspect. That is a debugger with a stop button
+made of a reset.
+
+Added `BdmClient.background()` and `POST /api/halt`. The route reads
+BDCSCR back and reports `halted` from BDMACT rather than assuming the
+command worked — BACKGROUND is ignored unless ENBDM is already 1
+(Finding 100), and a panel must not claim a halt it did not get.
+
+Measured, against the running blinky:
+
+```
+POST /api/halt   -> {"bdcscr":200,"halted":true}     (0xC8 = ENBDM|BDMACT|CLKSW)
+```
+
+### Finding 111 — the $0060-$006F defect has spread AGAIN, in under a day
+
+`identify?defect_scan=1`, run at the start of this session against the
+same die:
+
+```
+                       60 61 62 63 64 65 66 67 68 69 6A 6B 6C 6D 6E 6F
+TENTH session F92      7F 00 00 FF FF 7C FF FF 7C FF FF 00 7F 00 FF 00
+ELEVENTH session F106  7F 00 00 FF FF 7C 00 00 7C 00 00 00 7F 00 FF 00
+now                    7F 00 00 FF FF 7C 00 00 7C 00 00 00 7F 00 FF 00
+```
+
+Unchanged since the ELEVENTH session (13 of the 16 cells are damaged;
+$0063, $0064 and $006E still take arbitrary data), but the point stands
+and is now load-bearing in the UI: the memory map marks defective cells
+**only** from a live `defect_scan`, and marks nothing at all until one has
+been run. Finding 92's table is never drawn.
