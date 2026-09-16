@@ -502,6 +502,56 @@ def api_capture():
         return api_error(e)
 
 
+@app.route("/api/capture_pin", methods=["POST"])
+def api_capture_pin():
+    """THIRTEENTH session: record an arbitrary Pico GPIO passively.
+
+    POST {"gpio":16,"sample_count":256,"window_us":2000}
+    -> {"ok":true,"samples":[0,1,...],"sample_period_ns":7812,
+        "triggered":true,"gpio":16}
+
+    This is the only honest way to get a waveform off a target pin that is
+    not BKGD: nothing on this board is wired to PTA/PTB/PTC, so the pin has
+    to be patched to a spare GPIO first. `triggered` is false when the
+    falling-edge arm never fired -- the UI must show that as "no measurement"
+    rather than drawing the partial buffer as a flat line.
+    """
+    try:
+        body = json_body()
+        gpio = check_range(to_int(body.get("gpio"), "gpio"), "gpio", 0, 28)
+        sample_count = to_int(body.get("sample_count", 256), "sample_count")
+        check_range(sample_count, "sample_count", 32, 4096)
+        if sample_count % 32 != 0:
+            return api_error("sample_count must be a multiple of 32")
+        window_us = float(body.get("window_us", 2000))
+        if window_us <= 0:
+            return api_error("window_us must be positive")
+        result = client.capture_pin(gpio, sample_count=sample_count,
+                                    window_us=window_us)
+        return jsonify({"ok": True, **result})
+    except (BdmClientError, KeyError, ValueError, TypeError) as e:
+        return api_error(e)
+
+
+@app.route("/api/probe_pin", methods=["POST"])
+def api_probe_pin():
+    """Cheap activity measurement on any Pico GPIO: low duty and edge count
+    over `ms` milliseconds of plain SIO sampling.
+
+    POST {"gpio":16,"ms":30}
+    -> {"ok":true,"pin":16,"samples":1231,"low_pct":16.5,"transitions":408}
+    """
+    try:
+        body = json_body()
+        gpio = check_range(to_int(body.get("gpio"), "gpio"), "gpio", 0, 28)
+        ms = check_range(to_int(body.get("ms", 30), "ms"), "ms", 1, 500)
+        result = client.probe_pin(gpio, ms=ms)
+        result.setdefault("ms", ms)
+        return jsonify({"ok": True, **result})
+    except (BdmClientError, KeyError, ValueError, TypeError) as e:
+        return api_error(e)
+
+
 # The union-of-pages computation that used to live here (_pages_touched) is
 # gone: firmware's flash_program_image() builds the page map from all chunks
 # itself, so the "chunk B's erase wipes chunk A" hazard it worked around

@@ -1234,6 +1234,75 @@ class Bdc:
                 bits.append((w >> i) & 1)
         return {"samples": bits, "sample_period_ns": sample_period_ns}
 
+    def capture_pin(self, pin_num, sample_count=256, window_us=2000.0,
+                    arm_timeout_ms=400):
+        """THIRTEENTH session: the same passive PIO scope as _capture(), but
+        watching an arbitrary GPIO and with NOTHING driven by us.
+
+        _capture() exists to watch BKGD *while this Pico drives it*, so it
+        takes a drive_fn and its timeout assumes the signal is about to
+        happen because we are about to cause it. This one is for a target pin
+        patched to a spare GPIO: the target is the only thing driving, so
+        there is no drive_fn, and the trigger may legitimately never fire --
+        in which case that is reported as `triggered: False` rather than
+        returned as a flat line pretending to be a measurement.
+
+        make_capture_state_machine() was already parameterised by pin, so no
+        PIO program changes: bdc_pio.py is untouched by this.
+
+        The RX-FIFO caveat from _capture() applies unchanged: the FIFO is 4
+        words = 128 samples and the drain loop is Python, so beyond 128
+        samples contiguity in time needs a sample period of >= ~2 us. The
+        default window here (2 ms across 256 samples => 7.8 us/sample) is
+        comfortably inside that.
+        """
+        pin_num = int(pin_num)
+        sample_count = int(sample_count)
+        if sample_count <= 0 or sample_count % 32 != 0:
+            raise BdcError("sample_count must be a positive multiple of 32")
+        window_us = float(window_us)
+        if window_us <= 0:
+            raise BdcError("window_us must be positive")
+
+        cap_freq = int(sample_count * CYCLES_PER_SAMPLE * 1e6 / window_us)
+        cap_freq = int(min(max(cap_freq, SM_MIN_FREQ_HZ), SM_MAX_FREQ_HZ))
+
+        cap_sm = make_capture_state_machine(pin_num, cap_freq)
+        if pin_num == self.bkgd_pin_num:
+            # Same rule as _capture(): constructing the capture SM on BKGD
+            # takes that pin's function select away from the cached tx/rx
+            # state machines, so they must be rebound before the next
+            # transfer.
+            self._pio_bound = False
+        cap_sm.active(1)
+        cap_sm.put(sample_count)   # arms the falling-edge trigger
+
+        words = []
+        needed_words = sample_count // 32
+        # Real time budget: the capture window itself, plus the time the
+        # trigger is allowed to wait for a falling edge.
+        deadline = time.ticks_add(
+            time.ticks_ms(), int(arm_timeout_ms + window_us / 1000) + 50)
+        while len(words) < needed_words:
+            if cap_sm.rx_fifo():
+                words.append(cap_sm.get())
+            elif time.ticks_diff(deadline, time.ticks_ms()) <= 0:
+                break
+        cap_sm.active(0)
+
+        triggered = len(words) == needed_words
+        sample_period_ns = int(1e9 * CYCLES_PER_SAMPLE / cap_freq)
+        bits = []
+        for w in words:
+            for i in range(31, -1, -1):
+                bits.append((w >> i) & 1)
+        return {
+            "samples": bits,
+            "sample_period_ns": sample_period_ns,
+            "triggered": triggered,
+            "pin": pin_num,
+        }
+
     def capture_sync(self, sample_count=256, window_us=600):
         """Capture a whole SYNC handshake.
 

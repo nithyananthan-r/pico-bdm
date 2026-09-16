@@ -263,6 +263,47 @@ class BdmClient:
             "bit_value": resp.get("bit_value"),
         }
 
+    def capture_pin(self, gpio, sample_count=256, window_us=2000):
+        """THIRTEENTH session: passive capture of an arbitrary Pico GPIO.
+
+        This is what makes a REAL waveform possible for a target pin that is
+        not BKGD: patch the target pin to a spare GPIO and record it. The
+        programmer drives nothing, so `triggered` matters -- False means the
+        falling-edge arm never fired and there is no measurement, not that
+        the line was flat.
+        """
+        resp = self._call(
+            {"cmd": "capture_pin", "pin": int(gpio),
+             "sample_count": int(sample_count), "window_us": float(window_us)},
+            timeout=5,
+        )
+        packed = base64.b64decode(resp["samples_b64"])
+        n = resp["n_samples"]
+        bits = []
+        for i in range(n):
+            byte = packed[i // 8]
+            bits.append((byte >> (7 - (i % 8))) & 1)
+        return {
+            "samples": bits,
+            "sample_period_ns": resp["sample_period_ns"],
+            "triggered": bool(resp.get("triggered", True)),
+            "gpio": resp.get("pin", int(gpio)),
+        }
+
+    def probe_pin(self, gpio, ms=30, pull=None):
+        """Activity on any GPIO: what fraction of the window read low and how
+        many edges. Already existed in firmware (used to tell a free-running
+        target from a halted one); wired up to the host for the first time
+        here so the package panel can answer "is this pin doing anything".
+        """
+        resp = self._call(
+            {"cmd": "probe_pin", "pin": int(gpio), "ms": int(ms),
+             "pull": pull},
+            timeout=5,
+        )
+        resp.pop("ok", None)
+        return resp
+
     # -- ELEVENTH session: safety, security, and state ---------------------
     def chip_info(self, bus_freq_hz=None, blank_check=False):
         req = {"cmd": "chip_info", "blank_check": bool(blank_check)}

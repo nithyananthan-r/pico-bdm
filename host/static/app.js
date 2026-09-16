@@ -48,20 +48,197 @@ $("theme-select").value = localStorage.getItem(THEME_KEY) || "amber";
 applyTheme($("theme-select").value);
 $("theme-select").addEventListener("change", (e) => applyTheme(e.target.value));
 
-// -- advanced (Memory/Scope/Registers/Options) toggle ---------------------
-const ADVANCED_KEY = "pico-bdm-advanced";
-const benchEl = document.querySelector(".bench");
-const advancedToggle = $("advanced-toggle");
-function setAdvanced(show) {
-  benchEl.classList.toggle("show-advanced", show);
-  advancedToggle.textContent = show ? "Hide advanced ▾" : "Show advanced ▸";
-  advancedToggle.setAttribute("aria-pressed", String(show));
-  localStorage.setItem(ADVANCED_KEY, show ? "1" : "0");
+// =======================================================================
+// Features menu + slide-over
+//
+// The page used to stack every panel vertically and hide four of them behind
+// a "Show advanced" toggle. That toggle is GONE and this menu replaces it:
+// one mechanism for "show me a panel", not two. The default page is now only
+// Connection / Chip / Program / Log -- the connect-and-flash path -- and
+// everything else is opened from here.
+//
+// Panels are MOVED, not duplicated: the single <section> lives in
+// #feature-stash and is appended into the drawer on open, returned on close.
+// So ids stay unique, listeners stay attached, and any live state a panel is
+// carrying (a half-scanned memory map, a rendered waveform, a programming
+// run in flight) survives being closed and reopened. Nothing in this file
+// gates polling or a flash job on a panel being visible.
+// =======================================================================
+const FEATURES = [
+  { id: "debug", group: "Target", module: "module-debug",
+    name: "Live state & debugger", key: "1",
+    sub: "polls the target — registers, BDCSCR, pins, halt/go/step",
+    desc: "CPU registers, BDCSCR bits, halt / go / step / breakpoints" },
+  { id: "package", group: "Target", module: "module-package",
+    name: "Chip package & live pins", key: "2",
+    sub: "20-TSSOP pinout with live levels from the same poll",
+    desc: "the real 20-TSSOP pinout, lit from live port reads" },
+  { id: "memmap", group: "Target", module: "module-memmap",
+    name: "Memory map", key: "3",
+    sub: "the whole address space, coloured by what is actually on the chip",
+    desc: "2D map of the address space; animates a programming run" },
+  { id: "security", group: "Target", module: "module-security",
+    name: "Security & code protect", key: "4",
+    sub: "SEC bits, lock, and the mass-erase + erase-verify recovery",
+    desc: "lock the part, or wipe-and-unsecure it" },
+  { id: "verifydump", group: "FLASH", module: "module-verifydump",
+    name: "Verify / dump / erase", key: "5",
+    sub: "independent read-back, backup to .s19, blank check, mass erase",
+    desc: "read the chip back and compare, or save it to a file" },
+  { id: "memory", group: "Advanced", module: "module-memory",
+    name: "Memory peek & poke", key: "6",
+    sub: "read and write single bytes and blocks",
+    desc: "byte-level read/write at an arbitrary address" },
+  { id: "registers", group: "Advanced", module: "module-registers",
+    name: "Registers & BDCSCR", key: "7",
+    sub: "direct CPU register and BDC status/control access",
+    desc: "raw register access — requires sync" },
+  { id: "scope", group: "Advanced", module: "module-scope",
+    name: "Scope (BKGD self-capture)", key: "8",
+    sub: "record the real BKGD waveform with the Pico's second PIO machine",
+    desc: "the actual BDC line, no logic analyzer needed" },
+  { id: "options", group: "Advanced", module: "module-options",
+    name: "Options", key: "9",
+    sub: "log behaviour, poll interval, capture sample count",
+    desc: "poll interval, log options, scope sample count" },
+];
+
+const featuresBtn = $("features-btn");
+const featuresMenu = $("features-menu");
+const stash = $("feature-stash");
+const drawer = $("drawer");
+const drawerBody = $("drawer-body");
+let openFeature = null;
+
+function buildFeaturesMenu() {
+  featuresMenu.innerHTML = "";
+  let lastGroup = null;
+  for (const f of FEATURES) {
+    if (f.group !== lastGroup) {
+      featuresMenu.appendChild(el("div", "menu-group", f.group));
+      lastGroup = f.group;
+    }
+    const b = el("button", "menu-item");
+    b.type = "button";
+    b.setAttribute("role", "menuitem");
+    b.dataset.feature = f.id;
+    const n = el("span", "mi-name");
+    n.appendChild(document.createTextNode(f.name));
+    n.appendChild(el("span", "mi-key", "alt+" + f.key));
+    b.appendChild(n);
+    b.appendChild(el("span", "mi-desc", f.desc));
+    b.addEventListener("click", () => {
+      closeMenu();
+      showFeature(f.id);
+    });
+    featuresMenu.appendChild(b);
+  }
 }
-setAdvanced(localStorage.getItem(ADVANCED_KEY) === "1");
-advancedToggle.addEventListener("click", () =>
-  setAdvanced(!benchEl.classList.contains("show-advanced"))
-);
+
+function openMenu() {
+  featuresMenu.hidden = false;
+  featuresBtn.setAttribute("aria-expanded", "true");
+  markMenuOpenState();
+}
+function closeMenu() {
+  featuresMenu.hidden = true;
+  featuresBtn.setAttribute("aria-expanded", "false");
+}
+function markMenuOpenState() {
+  featuresMenu.querySelectorAll(".menu-item").forEach((b) =>
+    b.classList.toggle("open", b.dataset.feature === openFeature)
+  );
+}
+
+featuresBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  featuresMenu.hidden ? openMenu() : closeMenu();
+});
+document.addEventListener("click", (e) => {
+  if (!featuresMenu.hidden && !featuresMenu.contains(e.target)) closeMenu();
+});
+
+// Any "… ▸" link inside a panel is a shortcut into the same menu.
+document.addEventListener("click", (e) => {
+  const link = e.target.closest(".feature-link");
+  if (link && link.dataset.feature) showFeature(link.dataset.feature);
+});
+
+function featureById(id) {
+  return FEATURES.find((f) => f.id === id) || null;
+}
+
+function showFeature(id) {
+  const f = featureById(id);
+  if (!f) return;
+  if (openFeature === id) return;          // already on screen
+  returnOpenPanel();
+  const section = $(f.module);
+  if (!section) return;
+  $("drawer-title").textContent = f.name;
+  $("drawer-sub").textContent = f.sub;
+  drawerBody.appendChild(section);
+  drawer.hidden = false;
+  openFeature = id;
+  markMenuOpenState();
+  // Panels that draw themselves from measured geometry need a layout pass
+  // before they are correct; they were display:none a moment ago.
+  if (id === "package") renderPackage();
+  drawerBody.scrollTop = 0;
+}
+
+function returnOpenPanel() {
+  if (!openFeature) return;
+  // If a programming run parked its progress block beside the map, put it
+  // back on the page before the map leaves the screen -- navigating away
+  // from this panel must never hide a job that is still on the wire.
+  if (typeof parkProgressWithMap === "function") parkProgressWithMap(false);
+  const f = featureById(openFeature);
+  const section = f && $(f.module);
+  if (section) stash.appendChild(section);
+  openFeature = null;
+}
+
+function closeDrawer() {
+  if (drawer.hidden) return;
+  hidePinTip();
+  returnOpenPanel();
+  drawer.hidden = true;
+  markMenuOpenState();
+}
+
+function stepFeature(delta) {
+  if (!openFeature) return;
+  const i = FEATURES.findIndex((f) => f.id === openFeature);
+  const next = FEATURES[(i + delta + FEATURES.length) % FEATURES.length];
+  showFeature(next.id);
+}
+
+$("drawer-close").addEventListener("click", closeDrawer);
+$("drawer-prev").addEventListener("click", () => stepFeature(-1));
+$("drawer-next").addEventListener("click", () => stepFeature(1));
+drawer.addEventListener("click", (e) => {
+  if (e.target === drawer) closeDrawer();   // click outside the panel
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (!featuresMenu.hidden) return closeMenu();
+    if (!drawer.hidden && $("confirm-modal").hidden && guideModal.hidden) {
+      return closeDrawer();
+    }
+  }
+  // alt+<n> jumps straight to a feature without touching the mouse.
+  if (e.altKey && !e.ctrlKey && !e.metaKey) {
+    const f = FEATURES.find((x) => x.key === e.key);
+    if (f) {
+      e.preventDefault();
+      openFeature === f.id ? closeDrawer() : showFeature(f.id);
+    }
+  }
+});
+
+buildFeaturesMenu();
 
 // -- "how to use this page" guide modal ----------------------------------
 const guideModal = $("guide-modal");
@@ -207,6 +384,7 @@ $("connect-btn").addEventListener("click", async () => {
         : `connected to ${port}`,
       "ok"
     );
+    loadWiring();
     // The server may still be synced from before a page reload. Probe for
     // it rather than assuming either way -- if the link answers, the chip
     // panel fills in immediately, which is the point of this panel.
@@ -215,6 +393,23 @@ $("connect-btn").addEventListener("click", async () => {
     log(e.message, "err");
   }
 });
+
+// The package panel claims which target pins reach the Pico. Ask the Pico
+// rather than trusting the constants in firmware/main.py: if someone rewires
+// the rig, the claim has to move with it. Until this answers, the panel says
+// "firmware default — not confirmed this session".
+async function loadWiring() {
+  try {
+    const p = await api("/api/power");
+    wiring = {
+      bkgd_pin: p.bkgd_pin, reset_pin: p.reset_pin, vdd_pin: p.vdd_pin,
+      confirmed: true,
+    };
+    if (pkgBuilt) { pkgBuilt = false; renderPackage(); }
+  } catch (e) {
+    /* leave the defaults, still labelled unconfirmed */
+  }
+}
 
 async function probeExistingLink() {
   try {
@@ -743,6 +938,7 @@ function stopPolling() {
   $("poll-btn").classList.remove("on");
   $("poll-rate").textContent = "stopped";
   document.querySelectorAll(".pin").forEach((p) => p.classList.add("stale"));
+  updatePackage(null);
 }
 
 $("poll-btn").addEventListener("click", () =>
@@ -757,6 +953,7 @@ async function pollOnce() {
       $("poll-rate").textContent =
         "link busy with another operation — not polling (" + pollBusyStreak + ")";
       document.querySelectorAll(".pin").forEach((p) => p.classList.add("stale"));
+      updatePackage(null);
       return;
     }
     pollBusyStreak = 0;
@@ -782,6 +979,7 @@ function showLinkLost(msg) {
   document.querySelectorAll(".pin").forEach((p) => p.classList.add("stale"));
   $("bdcscr-readout").textContent = "BDCSCR — (no answer)";
   $("bdcscr-bits").innerHTML = "";
+  updatePackage(null);
 }
 
 function renderLiveState(s) {
@@ -824,6 +1022,10 @@ function renderLiveState(s) {
 
   renderRegs(s.cpu_regs, s.halted);
   renderPorts(s.ports);
+  // ONE poller feeds both pin views. The package diagram is not allowed a
+  // poller of its own -- two would double the BDM traffic and could show two
+  // different answers at the same instant.
+  updatePackage(s.ports);
 }
 
 function renderRegs(regs, halted) {
@@ -901,6 +1103,555 @@ function renderPorts(ports) {
     const n = el("span", "hint port-note", ports.note || "");
     g.appendChild(n);
   }
+}
+
+// =======================================================================
+// Chip package diagram — 20-TSSOP, live pins
+//
+// The pin table below is transcribed from the MC9S08SG8 MCU Series Data
+// Sheet Rev. 8, Table 2-1 "Pin Availability by Package Pin-Count" (p.31),
+// column "20-pin". It was re-read out of the data sheet for this panel
+// rather than carried over from anywhere -- a wrong pinout drawn
+// confidently is exactly the class of claim this project does not make.
+//
+// `alt` is the Alt-1..Alt-5 chain for that pin, in the data sheet's own
+// priority order (highest-priority peripheral first). Footnotes that matter
+// are folded into `note`.
+// =======================================================================
+const PKG_PINS = [
+  { n: 1, name: "RESET", kind: "special", alt: [],
+    note: "Dedicated reset. Wired to the programmer." },
+  { n: 2, name: "BKGD", kind: "special", alt: ["MS"],
+    note: "Single-wire background debug pin, and the mode-select pin at " +
+          "reset. This is the one the whole BDC link runs on." },
+  { n: 3, name: "VDD", kind: "power", alt: [],
+    note: "Target supply. Driven from a Pico GPIO on this rig." },
+  { n: 4, name: "VSS", kind: "power", alt: [], note: "Ground." },
+  { n: 5, port: "B", bit: 7, name: "PTB7", alt: ["SCL1", "EXTAL"],
+    note: "IIC pins can be repositioned with IICPS in SOPT2; the reset " +
+          "default for SCL1/SDA1 is PTA3/PTA2, not here." },
+  { n: 6, port: "B", bit: 6, name: "PTB6", alt: ["SDA1", "XTAL"],
+    note: "IIC default position is PTA3/PTA2 (IICPS in SOPT2)." },
+  { n: 7, port: "B", bit: 5, name: "PTB5", alt: ["TPM1CH1", "SS", "PTC0"],
+    note: "TPM1 channel pins can be repositioned with TPM1PS in SOPT2; the " +
+          "reset default for TPM1CH1 IS this pin. Also part of the ganged " +
+          "output feature." },
+  { n: 8, port: "B", bit: 4, name: "PTB4", alt: ["TPM2CH1", "MISO", "PTC0"],
+    note: "Ganged-output capable." },
+  { n: 9, port: "C", bit: 3, name: "PTC3", alt: ["PTC0", "ADP11"],
+    note: "20-pin package only." },
+  { n: 10, port: "C", bit: 2, name: "PTC2", alt: ["PTC0", "ADP10"],
+    note: "20-pin package only." },
+  { n: 11, port: "C", bit: 1, name: "PTC1", alt: ["TPM1CH1", "PTC0", "ADP9"],
+    note: "20-pin package only." },
+  { n: 12, port: "C", bit: 0, name: "PTC0", alt: ["TPM1CH0", "PTC0", "ADP8"],
+    note: "20-pin package only. Drives the ganged-output configuration for " +
+          "every other PTC0-tagged pin." },
+  { n: 13, port: "B", bit: 3, name: "PTB3", alt: ["PIB3", "MOSI", "PTC0", "ADP7"] },
+  { n: 14, port: "B", bit: 2, name: "PTB2", alt: ["PIB2", "SPSCK", "PTC0", "ADP6"] },
+  { n: 15, port: "B", bit: 1, name: "PTB1", alt: ["PIB1", "TxD", "ADP5"] },
+  { n: 16, port: "B", bit: 0, name: "PTB0", alt: ["PIB0", "RxD", "ADP4"] },
+  { n: 17, port: "A", bit: 3, name: "PTA3", alt: ["PIA3", "SCL1", "ADP3"],
+    note: "Reset-default IIC SCL position." },
+  { n: 18, port: "A", bit: 2, name: "PTA2", alt: ["PIA2", "SDA1", "ADP2", "ACMPO"],
+    note: "Reset-default IIC SDA position." },
+  { n: 19, port: "A", bit: 1, name: "PTA1", alt: ["PIA1", "TPM2CH0", "ADP1", "ACMP−"] },
+  { n: 20, port: "A", bit: 0, name: "PTA0", alt: ["PIA0", "TPM1CH0", "TCLK", "ADP0", "ACMP+"],
+    note: "Reset-default TPM1CH0 position (TPM1PS in SOPT2)." },
+];
+
+// Which target pins are physically wired to the programmer. Filled in from
+// /api/power when a link exists; the defaults below are firmware/main.py's
+// own constants and are labelled as such until the Pico confirms them.
+let wiring = { bkgd_pin: 15, reset_pin: 14, vdd_pin: 12, confirmed: false };
+
+function pkgWireFor(p) {
+  if (p.n === 1) return { gpio: wiring.reset_pin, what: "RESET" };
+  if (p.n === 2) return { gpio: wiring.bkgd_pin, what: "BKGD" };
+  if (p.n === 3) return { gpio: wiring.vdd_pin, what: "VDD (driven)" };
+  if (p.n === 4) return { gpio: null, what: "ground" };
+  return null;
+}
+
+const SVGNS = "http://www.w3.org/2000/svg";
+function svg(tag, attrs, cls) {
+  const e = document.createElementNS(SVGNS, tag);
+  for (const k in attrs || {}) e.setAttribute(k, attrs[k]);
+  if (cls) e.setAttribute("class", cls);
+  return e;
+}
+
+let pkgBuilt = false;
+let pkgPorts = null;        // last live_state ports payload, or null
+let pkgStale = true;
+let pkgSelected = null;     // pin number whose card is pinned open
+
+// Package geometry. Pins 1-10 run down the left, 11-20 back up the right,
+// which is how a real TSSOP is numbered (counter-clockwise from the dot).
+const PKG = { x: 160, y: 28, w: 140, h: 244, pitch: 24, top: 42,
+              leadW: 26, leadH: 7 };
+
+function pkgPinY(n) {
+  return n <= 10 ? PKG.top + (n - 1) * PKG.pitch
+                 : PKG.top + (20 - n) * PKG.pitch;
+}
+function pkgIsLeft(n) { return n <= 10; }
+
+function buildPackageSvg() {
+  const stage = $("pkg-stage");
+  stage.innerHTML = "";
+  const s = svg("svg", { viewBox: "0 0 440 300",
+                         preserveAspectRatio: "xMidYMid meet" });
+
+  const defs = svg("defs");
+  const f = svg("filter", { id: "pinglow", x: "-80%", y: "-200%",
+                            width: "260%", height: "500%" });
+  f.appendChild(svg("feGaussianBlur", { stdDeviation: "3" }));
+  defs.appendChild(f);
+  s.appendChild(defs);
+
+  // Package body, bevel and the pin-1 identifiers.
+  s.appendChild(svg("rect", { x: PKG.x, y: PKG.y, width: PKG.w,
+                              height: PKG.h, rx: 4 }, "pkg-body-fill"));
+  s.appendChild(svg("rect", { x: PKG.x + 5, y: PKG.y + 5, width: PKG.w - 10,
+                              height: PKG.h - 10, rx: 3 }, "pkg-body-bevel"));
+  s.appendChild(svg("path", {
+    d: `M ${PKG.x + PKG.w / 2 - 11} ${PKG.y} a 11 11 0 0 0 22 0 z`,
+  }, "pkg-notch"));
+  // Pin-1 dimple, in the corner where a real package carries it. The pin
+  // numbers start further in (x + 22) so the two never collide.
+  s.appendChild(svg("circle", { cx: PKG.x + 11, cy: PKG.y + 12, r: 4 }, "pkg-dot"));
+
+  const mark = svg("text", { x: PKG.x + PKG.w / 2, y: 140,
+                             "text-anchor": "middle", "font-size": "13" },
+                   "pkg-mark");
+  mark.textContent = "MC9S08SG8";
+  s.appendChild(mark);
+  const sub = svg("text", { x: PKG.x + PKG.w / 2, y: 157,
+                            "text-anchor": "middle", "font-size": "9" },
+                  "pkg-mark-sub");
+  sub.textContent = "20-TSSOP";
+  s.appendChild(sub);
+
+  for (const p of PKG_PINS) {
+    const left = pkgIsLeft(p.n);
+    const y = pkgPinY(p.n);
+    const g = svg("g", { "data-pin": p.n }, "pkg-pin");
+
+    const lx = left ? PKG.x - PKG.leadW : PKG.x + PKG.w;
+    g.appendChild(svg("rect", {
+      x: lx - 3, y: y - 6, width: PKG.leadW + 6, height: 12, rx: 5,
+      filter: "url(#pinglow)",
+    }, "pkg-glow"));
+    g.appendChild(svg("rect", {
+      x: lx, y: y - PKG.leadH / 2, width: PKG.leadW, height: PKG.leadH, rx: 1.5,
+    }, "pkg-lead"));
+    g.appendChild(svg("rect", {
+      x: lx - 4, y: y - 8, width: PKG.leadW + 8, height: 16, rx: 3,
+    }, "pkg-ring"));
+
+    const num = svg("text", {
+      x: left ? PKG.x + 22 : PKG.x + PKG.w - 22, y: y + 2.6,
+      "text-anchor": left ? "start" : "end",
+    }, "pkg-num");
+    num.textContent = String(p.n);
+    g.appendChild(num);
+
+    const lab = svg("text", {
+      x: left ? PKG.x - PKG.leadW - 6 : PKG.x + PKG.w + PKG.leadW + 6,
+      y: y + 2.8,
+      "text-anchor": left ? "end" : "start",
+    }, "pkg-label");
+    const t1 = svg("tspan");
+    t1.textContent = p.name;
+    lab.appendChild(t1);
+    const w = pkgWireFor(p);
+    if (w) {
+      g.classList.add("wired");
+      const t2 = svg("tspan", { dx: "5", "font-size": "7",
+                                fill: "var(--accent)" });
+      t2.textContent = w.gpio === null ? "·GND" : "·GP" + w.gpio;
+      if (left) lab.insertBefore(t2, t1);
+      else lab.appendChild(t2);
+      if (left) { t2.setAttribute("dx", "0"); t1.setAttribute("dx", "5"); }
+    }
+    g.appendChild(lab);
+
+    // One generous hit target per row, so the whole label+lead strip is
+    // hoverable instead of a 7px stub.
+    g.appendChild(svg("rect", {
+      x: left ? 0 : PKG.x + PKG.w, y: y - 11,
+      width: left ? PKG.x : 440 - PKG.x - PKG.w, height: 22,
+    }, "pkg-hit"));
+
+    s.appendChild(g);
+  }
+
+  stage.appendChild(s);
+
+  const legend = el("div", "pkg-legend");
+  [["lg-hi", "logic 1"], ["lg-lo", "logic 0"], ["lg-in", "configured as input"],
+   ["lg-sp", "debug pin (RESET / BKGD)"], ["lg-pw", "supply"],
+   ["lg-stale", "no live reading"]].forEach(([c, t]) => {
+    const sp = el("span");
+    sp.appendChild(el("i", c));
+    sp.appendChild(document.createTextNode(t));
+    legend.appendChild(sp);
+  });
+  stage.appendChild(legend);
+
+  s.addEventListener("mousemove", onPkgHover);
+  s.addEventListener("mouseleave", () => { hidePinTip(); pkgHoverPin(null); });
+  s.addEventListener("click", (e) => {
+    const g = e.target.closest(".pkg-pin");
+    if (!g) return;
+    const n = +g.dataset.pin;
+    pkgSelected = pkgSelected === n ? null : n;
+    renderPinDetail(pkgSelected);
+    markPkgSelection();
+  });
+
+  pkgBuilt = true;
+}
+
+function markPkgSelection() {
+  $("pkg-stage").querySelectorAll(".pkg-pin").forEach((g) =>
+    g.classList.toggle("sel", +g.dataset.pin === pkgSelected)
+  );
+}
+
+function pkgHoverPin(n) {
+  $("pkg-stage").querySelectorAll(".pkg-pin").forEach((g) =>
+    g.classList.toggle("hov", +g.dataset.pin === n)
+  );
+}
+
+// -- live pin state ------------------------------------------------------
+function pinLive(p) {
+  // Returns {direction, level} from the last live_state snapshot, or null.
+  // Never synthesised: no snapshot means no answer, and the UI says so.
+  if (!p.port || !pkgPorts || pkgStale) return null;
+  const arr = pkgPorts[p.port];
+  if (!arr) return null;
+  return arr.find((x) => x.pin === p.name) || null;
+}
+
+function updatePackage(ports) {
+  pkgPorts = ports || null;
+  pkgStale = !ports;
+  applyPackageState();
+  if (pkgSelected !== null) renderPinDetail(pkgSelected);
+}
+
+function applyPackageState() {
+  if (!pkgBuilt) return;
+  for (const p of PKG_PINS) {
+    const g = $("pkg-stage").querySelector(`.pkg-pin[data-pin="${p.n}"]`);
+    if (!g) continue;
+    g.classList.remove("io", "hi", "lo", "in", "out", "stale",
+                       "special", "power");
+    if (p.kind === "special") { g.classList.add("special"); continue; }
+    if (p.kind === "power") { g.classList.add("power"); continue; }
+    g.classList.add("io");
+    const live = pinLive(p);
+    if (!live) { g.classList.add("stale"); continue; }
+    g.classList.add(live.level ? "hi" : "lo");
+    g.classList.add(live.direction === "out" ? "out" : "in");
+  }
+  const foot = $("pkg-foot");
+  if (foot) {
+    foot.textContent = pkgStale
+      ? "No live reading. Open Features → Live state & debugger and press " +
+        "Start polling; every pin here comes from that same /api/live_state " +
+        "snapshot, so nothing is drawn until the target has answered."
+      : "Live from /api/live_state — PTA/PTB/PTC data and direction " +
+        "registers, read over BDM. PTC is read and reported raw; it is " +
+        "bonded out on the 20-pin package (pins 9–12) but not on smaller ones.";
+  }
+}
+
+function renderPackage() {
+  if (!pkgBuilt) buildPackageSvg();
+  applyPackageState();
+  markPkgSelection();
+  if (pkgSelected === null) renderPinDetail(null);
+}
+
+// -- hover tooltip -------------------------------------------------------
+const pinTip = (() => {
+  const t = el("div", "pkg-tip");
+  t.hidden = true;
+  document.body.appendChild(t);
+  return t;
+})();
+
+function hidePinTip() { pinTip.hidden = true; }
+
+function onPkgHover(e) {
+  const g = e.target.closest(".pkg-pin");
+  if (!g) { hidePinTip(); pkgHoverPin(null); return; }
+  const n = +g.dataset.pin;
+  pkgHoverPin(n);
+  const p = PKG_PINS.find((x) => x.n === n);
+  const live = pinLive(p);
+  let state;
+  if (p.kind === "special" || p.kind === "power") {
+    state = "not a general-purpose I/O — no port register";
+  } else if (!live) {
+    state = pkgStale ? "no live reading (polling is off or the link is down)"
+                     : "not reported by the last snapshot";
+  } else {
+    state = `${live.direction === "out" ? "OUTPUT driving" : "INPUT reading"} ` +
+            `logic ${live.level}`;
+  }
+  pinTip.innerHTML = "";
+  const h = el("div");
+  h.appendChild(el("span", "tt", `pin ${p.n} · ${p.name}`));
+  pinTip.appendChild(h);
+  if (p.alt.length) pinTip.appendChild(el("div", "td", "alt: " + p.alt.join(" / ")));
+  pinTip.appendChild(el("div", "", state));
+  pinTip.appendChild(el("div", "td",
+    pkgSelected === n ? "click to unpin the detail card"
+                      : "click to open the detail card"));
+  pinTip.hidden = false;
+  const r = pinTip.getBoundingClientRect();
+  let x = e.clientX + 16, y = e.clientY + 14;
+  if (x + r.width > window.innerWidth - 8) x = e.clientX - r.width - 14;
+  if (y + r.height > window.innerHeight - 8) y = e.clientY - r.height - 12;
+  pinTip.style.left = x + "px";
+  pinTip.style.top = y + "px";
+}
+
+// -- detail card ---------------------------------------------------------
+function pdRow(parent, k, v, cls) {
+  const r = el("div", "pd-row");
+  r.appendChild(el("div", "pk", k));
+  const val = el("div", "pv" + (cls ? " " + cls : ""));
+  if (v instanceof Node) val.appendChild(v);
+  else val.textContent = v;
+  r.appendChild(val);
+  parent.appendChild(r);
+  return r;
+}
+
+function renderPinDetail(n) {
+  const d = $("pkg-detail");
+  if (!d) return;
+  d.innerHTML = "";
+  if (n === null || n === undefined) {
+    const e = el("div", "pd-empty");
+    e.innerHTML =
+      "<b>Hover</b> any pin for a quick read; <b>click</b> it to pin this " +
+      "card open, which is what you want when you are going to press a " +
+      "button in it.<br><br>Levels and directions come from the same " +
+      "<code>/api/live_state</code> poll the debugger panel uses — there is " +
+      "one poller, not two, and it keeps running while this panel is closed." +
+      "<br><br>A real <b>waveform</b> needs a physical wire. Only RESET, " +
+      "BKGD and VDD reach the Pico on this rig; every other pin needs a " +
+      "jumper to a spare GPIO, and this card will say so per pin rather " +
+      "than drawing a trace it cannot measure.";
+    d.appendChild(e);
+    return;
+  }
+  const p = PKG_PINS.find((x) => x.n === n);
+  if (!p) return;
+
+  const head = el("div", "pd-head");
+  head.appendChild(el("span", "pd-num", "PIN " + p.n));
+  head.appendChild(el("span", "pd-name", p.name));
+  head.appendChild(el("span", "pd-kind",
+    p.kind === "special" ? "debug / control"
+      : p.kind === "power" ? "supply"
+      : `port ${p.port} bit ${p.bit}`));
+  d.appendChild(head);
+
+  const rows = el("div", "pd-rows");
+  if (p.alt.length) {
+    const box = el("div", "pd-alts");
+    p.alt.forEach((a) => box.appendChild(el("b", "", a)));
+    pdRow(rows, "alt functions", box);
+  } else {
+    pdRow(rows, "alt functions", "none — dedicated pin", "dim");
+  }
+
+  const live = pinLive(p);
+  if (p.kind === "special" || p.kind === "power") {
+    pdRow(rows, "direction", "n/a — not a GPIO", "dim");
+    pdRow(rows, "level", "n/a — no port register to read", "dim");
+  } else if (!live) {
+    pdRow(rows, "direction", "no live reading", "dim");
+    pdRow(rows, "level",
+      pkgStale ? "polling is off, or the link is down" : "not in the snapshot",
+      "dim");
+  } else {
+    pdRow(rows, "direction",
+      live.direction === "out" ? "OUTPUT (driving)" : "INPUT (reading the pin)",
+      live.direction === "out" ? "warn" : undefined);
+    pdRow(rows, "level", `logic ${live.level}`, live.level ? "good" : "dim");
+    pdRow(rows, "source",
+      `PT${p.port}D bit ${p.bit} / PT${p.port}DD bit ${p.bit}, read over BDM`);
+  }
+  d.appendChild(rows);
+
+  if (p.note) {
+    const note = el("div", "pd-note", p.note);
+    d.appendChild(note);
+  }
+
+  // -- what can honestly be captured on THIS pin ------------------------
+  const w = pkgWireFor(p);
+  const cap = el("div", "pd-capture");
+  if (w && w.gpio !== null) {
+    const nt = el("div", "pd-note wired",
+      `Physically wired to the programmer on Pico GP${w.gpio}` +
+      (wiring.confirmed ? " (confirmed by the Pico)"
+                        : " (firmware default — not confirmed this session)") +
+      ". A capture on this pin is a real measurement.");
+    cap.appendChild(nt);
+    buildCaptureControls(cap, p, w.gpio);
+  } else if (w) {
+    cap.appendChild(el("div", "pd-note wired",
+      "Ground. Nothing to capture."));
+  } else {
+    cap.appendChild(el("div", "pd-note unwired",
+      "NOT wired to the programmer. The three wires to this target are " +
+      "RESET, BKGD and VDD — this pin goes nowhere the Pico can see, so no " +
+      "waveform or duty cycle can be measured from it as the rig stands. " +
+      "Patch a jumper from this pin to a spare Pico GPIO, enter that GPIO " +
+      "below, and the capture becomes real."));
+    buildCaptureControls(cap, p, null);
+  }
+  d.appendChild(cap);
+}
+
+function buildCaptureControls(parent, p, defaultGpio) {
+  const row = el("div", "row");
+  row.appendChild(el("label", "", "Pico GPIO"));
+  const gpioIn = document.createElement("input");
+  gpioIn.type = "text";
+  gpioIn.className = "mono";
+  gpioIn.value = defaultGpio === null ? "" : String(defaultGpio);
+  gpioIn.placeholder = "e.g. 16";
+  gpioIn.title = "the Pico GPIO this target pin is physically connected to";
+  row.appendChild(gpioIn);
+
+  row.appendChild(el("label", "", "window µs"));
+  const winIn = document.createElement("input");
+  winIn.type = "text";
+  winIn.className = "mono";
+  winIn.value = "2000";
+  winIn.style.width = "5em";
+  winIn.title =
+    "how much real time the 256 samples should span. A 1 kHz PWM needs " +
+    "~2000 us to show a whole cycle; a fast SPI clock needs ~20.";
+  row.appendChild(winIn);
+  parent.appendChild(row);
+
+  const row2 = el("div", "row");
+  const capBtn = el("button", "", "Capture waveform");
+  const probeBtn = el("button", "", "Activity / duty cycle");
+  probeBtn.title =
+    "30 ms of plain GPIO sampling: what fraction of the time the pin was " +
+    "low, and how many edges happened. Cheaper than a capture and enough to " +
+    "answer 'is this pin doing anything'.";
+  row2.appendChild(capBtn);
+  row2.appendChild(probeBtn);
+  parent.appendChild(row2);
+
+  const canvas = document.createElement("canvas");
+  canvas.className = "pin-scope";
+  canvas.width = 820;
+  canvas.height = 110;
+  parent.appendChild(canvas);
+  const out = el("div", "pd-scope-readout",
+    "no capture taken on this pin yet");
+  parent.appendChild(out);
+
+  const gpioOf = () => {
+    const v = gpioIn.value.trim();
+    if (v === "") throw new Error(
+      "enter the Pico GPIO this pin is patched to first — there is no wire " +
+      "to it otherwise, and a capture would be measuring an unconnected pad");
+    const g = parseNum(v);
+    if (g < 0 || g > 28) throw new Error("GPIO must be 0–28 on an RP2040");
+    return g;
+  };
+
+  capBtn.addEventListener("click", async () => {
+    capBtn.disabled = true;
+    out.textContent = "capturing…";
+    try {
+      const gpio = gpioOf();
+      const samples = parseInt($("opt-sample-count").value, 10) || 256;
+      const data = await jsonPost("/api/capture_pin", {
+        gpio,
+        sample_count: samples,
+        window_us: parseNum(winIn.value),
+      });
+      if (!data.triggered) {
+        // The PIO scope arms on a FALLING edge. If it never fired there is
+        // no window at all, and whatever partial buffer came back is not a
+        // measurement of anything -- so nothing is drawn.
+        drawWaveform([], data.sample_period_ns, canvas);
+        out.textContent =
+          `NO CAPTURE on GP${gpio}. The scope arms on a falling edge and the ` +
+          `pin never went low inside the arming window, so there is nothing ` +
+          `to draw — this is not "the line was flat".\n` +
+          `Either the pin is idle high and static, nothing is connected to ` +
+          `GP${gpio}, or the signal is slower than the window: try a larger ` +
+          `"window µs".`;
+        log(`capture on GP${gpio} did not trigger`, "warn");
+        return;
+      }
+      drawWaveform(data.samples, data.sample_period_ns, canvas);
+      const n = data.samples.length;
+      const hi = data.samples.filter((b) => b).length;
+      const edges = data.samples.reduce(
+        (a, b, i) => a + (i && b !== data.samples[i - 1] ? 1 : 0), 0);
+      const spanUs = (n * data.sample_period_ns) / 1000;
+      out.textContent =
+        `${n} samples @ ${data.sample_period_ns} ns ` +
+        `(${spanUs.toFixed(1)} µs window) on GP${gpio}\n` +
+        `high for ${((100 * hi) / n).toFixed(1)}% of the window, ` +
+        `${edges} edge(s)` +
+        (edges >= 2
+          ? ` — ~${(edges / 2 / (spanUs / 1e6)).toFixed(0)} Hz if periodic`
+          : "") +
+        (n > 128
+          ? "\nOnly the first 128 samples are guaranteed contiguous in time " +
+            "at fast sample rates (4-word RX FIFO, Python drain loop)."
+          : "");
+      log(`captured GP${gpio} for pin ${p.n} (${p.name})`, "ok");
+    } catch (e) {
+      out.textContent = e.message;
+      log(e.message, "err");
+    } finally {
+      capBtn.disabled = false;
+    }
+  });
+
+  probeBtn.addEventListener("click", async () => {
+    probeBtn.disabled = true;
+    out.textContent = "probing…";
+    try {
+      const gpio = gpioOf();
+      const d = await jsonPost("/api/probe_pin", { gpio, ms: 30 });
+      out.textContent =
+        `GP${gpio} over ${d.ms ?? 30} ms: low for ${d.low_pct.toFixed(1)}% ` +
+        `of ${d.samples} samples, ${d.transitions} transition(s).\n` +
+        (d.transitions === 0
+          ? "No edges: the pin is static (or unconnected)."
+          : `~${(d.transitions / 2 / ((d.ms ?? 30) / 1000)).toFixed(0)} Hz if ` +
+            `that is a square-ish periodic signal · duty ` +
+            `${(100 - d.low_pct).toFixed(1)}% high.`);
+      log(`probed GP${gpio} for pin ${p.n} (${p.name})`, "ok");
+    } catch (e) {
+      out.textContent = e.message;
+      log(e.message, "err");
+    } finally {
+      probeBtn.disabled = false;
+    }
+  });
 }
 
 // -- debugger controls ----------------------------------------------------
@@ -1062,6 +1813,19 @@ function writtenCellsFor(page, chunks) {
   );
 }
 
+// The progress block is MOVED next to the memory map while a live run is on
+// screen, rather than duplicated: the bar, the status line and the per-page
+// list are the same elements finishFlash() writes to either way, so there is
+// exactly one place a page result can be rendered.
+function parkProgressWithMap(withMap) {
+  const prog = $("flash-progress");
+  if (withMap) {
+    $("module-memmap").appendChild(prog);
+  } else if (prog.parentElement !== $("module-flash")) {
+    $("module-flash").insertBefore(prog, $("flash-output"));
+  }
+}
+
 $("flash-btn").addEventListener("click", async () => {
   const fileInput = $("srec-file");
   if (!fileInput.files.length) return log("choose a .s19 file first", "err");
@@ -1075,6 +1839,15 @@ $("flash-btn").addEventListener("click", async () => {
   if (live) form.append("async", "1");
 
   clearFlashDecor();
+  // The per-page animation is the whole point of the live path, and the map
+  // is no longer on the page by default -- so open it. It stays a normal
+  // slide-over: Esc or the x closes it, and closing it does NOT stop the job
+  // (watchProgress owns its own timer and the map keeps taking updates while
+  // it sits in the stash).
+  if ($("opt-live-progress").checked) {
+    showFeature("memmap");
+    parkProgressWithMap(true);
+  }
   $("flash-progress").hidden = false;
   $("page-list").innerHTML = "";
   $("flash-bar-fill").className = "flash-bar-fill";
@@ -1323,6 +2096,12 @@ function renderFlashReport(data) {
 }
 
 // -- verify --------------------------------------------------------------
+// Verify / dump / blank-check / mass-erase moved into their own feature
+// panel, so their output goes to that panel's own <pre> -- writing it into
+// the Program panel's report would have put the result behind the open
+// slide-over, where nobody would see it.
+function vdOut(text) { $("vd-output").textContent = text; }
+
 $("verify-btn").addEventListener("click", async () => {
   const fileInput = $("srec-file");
   if (!fileInput.files.length)
@@ -1338,7 +2117,7 @@ $("verify-btn").addEventListener("click", async () => {
       body: form,
     });
     if (!data.ok && data.error) throw new Error(data.error);
-    const out = $("flash-output");
+    const out = $("vd-output");
     if (data.match) {
       out.textContent =
         `VERIFY OK — ${data.bytes_checked} bytes read back off the chip ` +
@@ -1372,9 +2151,9 @@ $("verify-btn").addEventListener("click", async () => {
 $("dump-btn").addEventListener("click", async () => {
   const len = 0x10000 - flashStart;
   dot.classList.add("working");
-  $("flash-output").textContent =
+  vdOut(
     `reading ${len} bytes from ${addr16(flashStart)} — about ` +
-    `${(len * 0.0016).toFixed(0)} s at ~1.6 ms/byte…`;
+    `${(len * 0.0016).toFixed(0)} s at ~1.6 ms/byte…`);
   try {
     const d = await api(
       `/api/dump?addr=${flashStart}&len=${len}&format=hex&save=1`
@@ -1385,15 +2164,15 @@ $("dump-btn").addEventListener("click", async () => {
     applyScan("flash");
     $("memmap-status").textContent =
       `FLASH read back at ${new Date().toLocaleTimeString()} (from the backup dump)`;
-    $("flash-output").textContent =
+    vdOut(
       `dumped ${d.length} bytes from ${addr16(d.addr)}\n` +
       `saved to ${d.saved}\n` +
       (d.blank ? "every byte is 0xFF — the array is blank\n" : "") +
       (d.all_zero ? "WARNING: " + d.note + "\n" : "") +
-      `first 32 bytes: ${d.hex.slice(0, 64).toUpperCase().match(/../g).join(" ")}`;
+      `first 32 bytes: ${d.hex.slice(0, 64).toUpperCase().match(/../g).join(" ")}`);
     log(`dumped ${d.length} bytes to ${d.saved}`, "ok");
   } catch (e) {
-    $("flash-output").textContent = "dump failed — " + e.message;
+    vdOut("dump failed — " + e.message);
     log(e.message, "err");
   } finally {
     dot.classList.remove("working");
@@ -1769,8 +2548,10 @@ function themeColor(name, fallback) {
   return v || fallback;
 }
 
-function drawWaveform(samples, samplePeriodNs) {
-  const canvas = $("scope-canvas");
+// `canvas` defaults to the BKGD scope's canvas so every existing call site
+// is unchanged; the per-pin capture cards pass their own.
+function drawWaveform(samples, samplePeriodNs, canvas) {
+  canvas = canvas || $("scope-canvas");
   const ctx = canvas.getContext("2d");
   const W = canvas.width;
   const H = canvas.height;
@@ -1857,6 +2638,7 @@ async function init() {
     if (status.connected) {
       setConnected(true);
       log("server still has the serial port open");
+      loadWiring();
       await probeExistingLink();
     } else {
       setConnected(false);

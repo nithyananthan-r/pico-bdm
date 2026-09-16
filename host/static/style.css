@@ -1,6 +1,8 @@
 :root {
   --font-ui: "Inter", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
+  /* Fixed height of the Log panel's scroller -- see .log below. */
+  --log-height: 300px;
 }
 
 :root,
@@ -145,50 +147,29 @@ body {
   50%      { box-shadow: 0 0 0 6px rgba(232, 163, 61, 0); }
 }
 
+/* The default view is deliberately SMALL: only what a connect-and-flash run
+   needs. Everything else lives in #feature-stash and is moved into the
+   slide-over on demand, so this grid never grows again. */
 .bench {
   width: 100%;
   max-width: 1480px;
   margin: 0 auto;
-  padding: 16px 20px 40px;
+  padding: 16px 20px 28px;
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   grid-template-areas:
     "connect  chip"
-    "flash    debug"
-    "memmap   memmap"
-    "security log";
+    "flash    log";
   gap: 14px;
   align-items: start;
 }
 
-.bench.show-advanced {
-  grid-template-areas:
-    "connect   chip"
-    "flash     debug"
-    "memmap    memmap"
-    "security  log"
-    "memory    scope"
-    "registers registers"
-    "options   options";
-}
+#module-connect { grid-area: connect; }
+#module-chip    { grid-area: chip; }
+#module-flash   { grid-area: flash; }
+#module-log     { grid-area: log; }
 
-#module-connect   { grid-area: connect; }
-#module-chip      { grid-area: chip; }
-#module-flash     { grid-area: flash; }
-#module-debug     { grid-area: debug; }
-#module-memmap    { grid-area: memmap; }
-#module-security  { grid-area: security; }
-#module-log       { grid-area: log; }
-#module-memory    { grid-area: memory; }
-#module-scope     { grid-area: scope; }
-#module-registers { grid-area: registers; }
-#module-options   { grid-area: options; }
-
-#module-memory, #module-scope, #module-registers, #module-options { display: none; }
-.bench.show-advanced #module-memory,
-.bench.show-advanced #module-scope,
-.bench.show-advanced #module-registers,
-.bench.show-advanced #module-options { display: flex; }
+#feature-stash[hidden] { display: none; }
 
 .module {
   background: var(--panel);
@@ -315,7 +296,20 @@ button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red)
   overflow-y: auto;
 }
 
-.log { color: var(--text); max-height: 340px; min-height: 180px; }
+/* The log is the one panel whose content never stops arriving, so it gets a
+   FIXED height rather than a min/max pair: the panel is then exactly the
+   same size on the first line as on the thousandth, and the history scrolls
+   inside it instead of pushing the grid around. Height is a token so a theme
+   (or a future "tall log" option) can change it in one place. */
+.log {
+  color: var(--text);
+  height: var(--log-height);
+  min-height: var(--log-height);
+  max-height: var(--log-height);
+  flex: 0 0 auto;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
 .log .err { color: var(--red); }
 .log .ok { color: var(--green); }
 .log .warn { color: var(--accent); }
@@ -342,8 +336,8 @@ button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red)
 
 .fact-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(124px, 1fr));
+  gap: 6px;
   margin-bottom: 10px;
 }
 .fact {
@@ -908,6 +902,369 @@ button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red)
 .checkbox-row { display: flex; align-items: center; gap: 8px; }
 .checkbox-row label { color: var(--text); font-size: 13px; }
 
+/* =======================================================================
+   Features nav menu
+   ======================================================================= */
+.bench-nav { display: flex; align-items: center; gap: 8px; margin-left: 18px; flex: 1 1 auto; }
+.menu-wrap { position: relative; }
+
+.nav-btn {
+  background: var(--btn-bg);
+  border: 1px solid var(--panel-border);
+  color: var(--text);
+  padding: 6px 13px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.nav-btn:hover, .nav-btn[aria-expanded="true"] {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.nav-btn .caret { font-size: 10px; transition: transform 0.16s ease; }
+.nav-btn[aria-expanded="true"] .caret { transform: rotate(180deg); }
+
+.menu {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 0;
+  z-index: 60;
+  min-width: 330px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-top: 2px solid var(--accent);
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.45);
+  padding: 6px;
+  animation: menu-in 0.13s ease-out;
+}
+.menu[hidden] { display: none; }
+@keyframes menu-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.menu .menu-group {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 9px 9px 4px;
+  border-top: 1px solid var(--panel-border);
+  margin-top: 4px;
+}
+.menu .menu-group:first-child { border-top: none; margin-top: 0; padding-top: 4px; }
+
+.menu-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-left: 2px solid transparent;
+  color: var(--text);
+  padding: 7px 9px;
+  cursor: pointer;
+  font-family: var(--font-ui);
+}
+.menu-item:hover, .menu-item:focus-visible {
+  background: var(--input-bg);
+  border-left-color: var(--accent);
+  outline: none;
+}
+.menu-item .mi-name { font-size: 13px; font-weight: 500; display: flex; align-items: baseline; gap: 7px; }
+.menu-item .mi-name .mi-key {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  border: 1px solid var(--panel-border);
+  padding: 0 4px;
+}
+.menu-item .mi-desc { font-size: 11px; color: var(--text-dim); line-height: 1.35; }
+.menu-item.open .mi-name { color: var(--accent); }
+
+.feature-link { white-space: nowrap; }
+.feature-link:hover:not(:disabled) { text-decoration: underline; }
+
+/* =======================================================================
+   Feature slide-over
+   ======================================================================= */
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  justify-content: flex-end;
+  animation: fade-in 0.15s ease-out;
+}
+.drawer-backdrop[hidden] { display: none; }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+
+.drawer {
+  width: min(1180px, 94vw);
+  height: 100%;
+  background: var(--bg);
+  border-left: 1px solid var(--panel-border);
+  box-shadow: -18px 0 50px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  animation: drawer-in 0.19s cubic-bezier(0.22, 0.8, 0.3, 1);
+}
+@keyframes drawer-in {
+  from { transform: translateX(40px); opacity: 0.4; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--panel-border);
+  background: var(--panel);
+  flex: 0 0 auto;
+}
+.drawer-headings { flex: 1 1 auto; min-width: 0; }
+.drawer-head h2 {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 15px;
+  color: var(--accent);
+}
+.drawer-head .hint { display: block; margin-top: 2px; }
+
+.drawer-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 14px 18px 40px;
+}
+/* Inside the slide-over a panel keeps its own chrome AND its own <h2>. The
+   h2 is deliberately NOT hidden: several panels put their controls in it
+   (Start polling, Scan chip, Clear log), and hiding the heading to avoid
+   repeating the title took those buttons off the screen with it. The drawer
+   header carries the big title; the panel's own h2 stays as the dim
+   subheading it already was. */
+.drawer-body .module { border-top-width: 2px; min-height: 0; }
+.drawer-body .module.wide { grid-column: auto; }
+
+/* =======================================================================
+   Chip package diagram (20-TSSOP)
+   ======================================================================= */
+.pkg-layout {
+  display: grid;
+  grid-template-columns: minmax(360px, 1fr) minmax(300px, 420px);
+  gap: 18px;
+  align-items: start;
+}
+
+.pkg-stage {
+  background: var(--input-bg);
+  border: 1px solid var(--panel-border);
+  padding: 10px;
+  overflow: hidden;
+}
+.pkg-stage svg { width: 100%; height: auto; display: block; }
+
+/* Package body + silkscreen. Everything is a CSS variable so the five
+   themes carry through without a single hardcoded colour. */
+.pkg-body-fill   { fill: var(--btn-bg); stroke: var(--panel-border); stroke-width: 1.5; }
+.pkg-body-bevel  { fill: none; stroke: var(--panel-border); stroke-width: 1; opacity: 0.8; }
+.pkg-notch       { fill: var(--input-bg); stroke: var(--panel-border); stroke-width: 1; }
+.pkg-dot         { fill: var(--text-dim); }
+.pkg-mark        { fill: var(--text); font-family: var(--font-mono); font-weight: 700; }
+.pkg-mark-sub    { fill: var(--text-dim); font-family: var(--font-mono); }
+
+.pkg-lead {
+  fill: var(--panel-border);
+  stroke: var(--panel-border);
+  stroke-width: 0.5;
+  transition: fill 0.25s ease, stroke 0.25s ease;
+}
+.pkg-num  { fill: var(--text-dim); font-family: var(--font-mono); font-size: 7px; }
+.pkg-label {
+  fill: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 8px;
+  transition: fill 0.25s ease;
+}
+
+/* One hit target per pin: the lead, the number and the label all belong to
+   the same <g>, so the whole row is hoverable rather than a 4px stub. */
+.pkg-pin { cursor: pointer; }
+.pkg-hit { fill: transparent; }
+
+.pkg-pin .pkg-glow { fill: var(--green); opacity: 0; transition: opacity 0.25s ease; }
+
+/* State classes are driven ONLY by a live /api/live_state snapshot. With no
+   snapshot the pin stays in its default (grey) look -- the map never invents
+   a level it has not been told. */
+.pkg-pin.io .pkg-lead   { fill: var(--text-dim); stroke: var(--text-dim); }
+.pkg-pin.io.lo .pkg-lead { fill: var(--text-dim); stroke: var(--text-dim); opacity: 0.55; }
+.pkg-pin.io.hi .pkg-lead { fill: var(--green); stroke: var(--green); }
+.pkg-pin.io.hi .pkg-glow { opacity: 0.30; }
+.pkg-pin.io.hi.out .pkg-glow { opacity: 0.55; }
+.pkg-pin.io.hi .pkg-label { fill: var(--green); }
+.pkg-pin.io.out .pkg-lead { stroke-width: 1.6; }
+.pkg-pin.io.in .pkg-lead  { fill: var(--input-bg); stroke-width: 1.4; }
+.pkg-pin.io.in.hi .pkg-lead { fill: var(--input-bg); stroke: var(--green); }
+
+.pkg-pin.special .pkg-lead  { fill: var(--violet); stroke: var(--violet); }
+.pkg-pin.special .pkg-label { fill: var(--violet); }
+.pkg-pin.power .pkg-lead    { fill: var(--blue); stroke: var(--blue); }
+.pkg-pin.power .pkg-label   { fill: var(--blue); }
+
+.pkg-pin.stale .pkg-lead  { opacity: 0.3; }
+.pkg-pin.stale .pkg-label { opacity: 0.45; }
+.pkg-pin.stale .pkg-glow  { opacity: 0; }
+
+.pkg-pin:hover .pkg-label,
+.pkg-pin.sel .pkg-label { fill: var(--accent); font-weight: 700; }
+.pkg-pin:hover .pkg-lead,
+.pkg-pin.sel .pkg-lead { stroke: var(--accent); stroke-width: 2; opacity: 1; }
+.pkg-pin.sel .pkg-ring { stroke: var(--accent); stroke-width: 1.2; fill: none; }
+.pkg-pin .pkg-ring { stroke: none; fill: none; }
+
+/* A pin that is physically patched to a Pico GPIO gets a wire stub, so
+   "can this be captured for real?" is answerable at a glance. */
+.pkg-pin .pkg-wire { stroke: var(--accent); stroke-width: 1.2; stroke-dasharray: 2 2; opacity: 0; }
+.pkg-pin.wired .pkg-wire { opacity: 0.85; }
+
+.pkg-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 9px;
+}
+.pkg-legend span { display: flex; align-items: center; gap: 5px; }
+.pkg-legend i {
+  width: 10px; height: 10px; display: inline-block;
+  border: 1px solid var(--panel-border);
+}
+.pkg-legend i.lg-hi    { background: var(--green); }
+.pkg-legend i.lg-lo    { background: var(--text-dim); opacity: 0.55; }
+.pkg-legend i.lg-in    { background: var(--input-bg); border-color: var(--text-dim); }
+.pkg-legend i.lg-sp    { background: var(--violet); }
+.pkg-legend i.lg-pw    { background: var(--blue); }
+.pkg-legend i.lg-stale { background: var(--panel-border); }
+
+/* -- pin detail card ---------------------------------------------------- */
+.pkg-detail {
+  background: var(--input-bg);
+  border: 1px solid var(--panel-border);
+  border-left: 3px solid var(--accent);
+  padding: 12px 14px;
+  min-height: 250px;
+}
+.pkg-detail .pd-empty { color: var(--text-dim); font-size: 12.5px; line-height: 1.55; }
+.pkg-detail .pd-head {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  border-bottom: 1px solid var(--panel-border);
+  padding-bottom: 7px;
+  margin-bottom: 9px;
+}
+.pkg-detail .pd-num {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--bg);
+  background: var(--accent);
+  padding: 2px 7px;
+  font-weight: 700;
+}
+.pkg-detail .pd-name {
+  font-family: var(--font-mono);
+  font-size: 19px;
+  font-weight: 700;
+  color: var(--text);
+}
+.pkg-detail .pd-kind { font-size: 11px; color: var(--text-dim); margin-left: auto; }
+
+.pd-rows { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; }
+.pd-row {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  align-items: baseline;
+  border-bottom: 1px solid var(--panel-border);
+  padding-bottom: 4px;
+}
+.pd-row .pk { color: var(--text-dim); width: 8.4em; flex: 0 0 auto; font-size: 11px;
+              text-transform: uppercase; letter-spacing: 0.05em; }
+.pd-row .pv { font-family: var(--font-mono); color: var(--text); word-break: break-word; }
+.pd-row .pv.good { color: var(--green); }
+.pd-row .pv.dim  { color: var(--text-dim); font-style: italic; font-family: var(--font-ui); }
+.pd-row .pv.warn { color: var(--accent); }
+
+.pd-alts { display: flex; flex-wrap: wrap; gap: 4px; }
+.pd-alts b {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  color: var(--text);
+  background: var(--btn-bg);
+  border: 1px solid var(--panel-border);
+  padding: 1px 6px;
+}
+
+.pd-note {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  border-left: 2px solid var(--panel-border);
+  padding: 4px 0 4px 9px;
+  margin-bottom: 9px;
+}
+.pd-note.wired { border-left-color: var(--green); }
+.pd-note.unwired { border-left-color: var(--accent); }
+
+.pd-capture { border-top: 1px solid var(--panel-border); padding-top: 9px; }
+.pd-capture .row { margin-bottom: 6px; }
+.pd-capture input[type="text"] { width: 4.5em; }
+canvas.pin-scope {
+  width: 100%;
+  height: 110px;
+  background: var(--input-bg);
+  border: 1px solid var(--panel-border);
+  display: block;
+  margin-top: 7px;
+}
+.pd-scope-readout {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 5px;
+  line-height: 1.5;
+}
+
+/* Floating hover tooltip -- the quick read; the side card is the full one. */
+.pkg-tip {
+  position: fixed;
+  z-index: 120;
+  pointer-events: none;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  padding: 6px 9px;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--text);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  max-width: 280px;
+}
+.pkg-tip[hidden] { display: none; }
+.pkg-tip .tt { font-family: var(--font-mono); font-weight: 700; color: var(--accent); }
+.pkg-tip .td { color: var(--text-dim); }
+
+.pkg-note { margin: 0 0 9px; line-height: 1.5; }
+.pkg-foot { margin-top: 10px; line-height: 1.5; }
+
 /* -- themed scrollbars -------------------------------------------------- */
 * {
   scrollbar-width: thin;
@@ -924,6 +1281,11 @@ button.danger:hover:not(:disabled) { border-color: var(--red); color: var(--red)
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
+}
+
+@media (max-width: 980px) {
+  .pkg-layout { grid-template-columns: minmax(0, 1fr); }
+  .bench-nav { margin-left: 10px; }
 }
 
 @media (max-width: 1100px) {

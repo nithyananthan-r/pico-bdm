@@ -307,6 +307,43 @@ def handle(cmd):
         return ok(**bdc.probe_pin(int(cmd["pin"]), int(cmd.get("ms", 30)),
                                   cmd.get("pull")))
 
+    if name == "capture_pin":
+        # Passive scope on an ARBITRARY GPIO -- for a target pin patched to a
+        # spare Pico GPIO. Nothing is driven; the target is the only source.
+        # Same packing as "capture" below so the host decodes them
+        # identically.
+        try:
+            sample_count = int(cmd.get("sample_count", 256))
+        except (TypeError, ValueError):
+            return err("sample_count must be an integer")
+        if sample_count <= 0 or sample_count % 32 != 0:
+            return err("sample_count must be a positive multiple of 32")
+        try:
+            pin_num = int(cmd["pin"])
+        except (KeyError, TypeError, ValueError):
+            return err("pin is required and must be an integer GPIO number")
+        if not 0 <= pin_num <= 28:
+            return err("pin must be an RP2040 GPIO number, 0-28")
+        try:
+            window_us = float(cmd.get("window_us", 2000))
+        except (TypeError, ValueError):
+            return err("window_us must be a number")
+        if window_us <= 0:
+            return err("window_us must be positive")
+        result = bdc.capture_pin(pin_num, sample_count, window_us)
+        bits = result["samples"]
+        packed = bytearray((len(bits) + 7) // 8)
+        for i, b in enumerate(bits):
+            if b:
+                packed[i // 8] |= 1 << (7 - (i % 8))
+        return ok(
+            sample_period_ns=result["sample_period_ns"],
+            n_samples=len(bits),
+            triggered=result["triggered"],
+            pin=result["pin"],
+            samples_b64=binascii.b2a_base64(bytes(packed)).decode().strip(),
+        )
+
     if name == "rise_time":
         return ok(**bdc.rise_time(
             int(cmd["pin"]), cmd.get("hold_ms", 1), cmd.get("trials", 6)))
