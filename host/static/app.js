@@ -670,7 +670,15 @@ function renderChipInfo(info) {
 // =======================================================================
 const mapBody = $("map-body");
 let mapRegions = [];   // {key,name,start,end,gran,cells:[{elt,start,end}],rows:[]}
-const scanned = {};    // key -> {start, bytes:Uint8Array}
+// key -> array of disjoint {start, bytes:Uint8Array} ranges actually read
+// back from the target. Kept as a list, not one contiguous buffer, because
+// a page-at-a-time FLASH write (Finding 107) touches addresses far apart
+// (e.g. $E000 and $FE00) -- filling the gap between them with zero bytes
+// would render cells that were never read as if they were known-blank or
+// known-zero, which is exactly the kind of fabricated data this project
+// refuses to show (the same rule live_state already enforces for
+// registers/pins).
+const scanned = {};
 
 function regionSpec() {
   return [
@@ -806,23 +814,30 @@ function classifyBytes(bytes) {
 }
 
 function applyScan(key) {
-  const s = scanned[key];
-  if (!s) return;
+  const ranges = scanned[key];
+  if (!ranges || !ranges.length) return;
   const region = mapRegions.find((r) => r.key === key);
   if (!region) return;
   for (const c of region.cells) {
-    const off = c.start - s.start;
-    if (off < 0 || off + (c.end - c.start) >= s.bytes.length) continue;
-    const slice = s.bytes.subarray(off, off + (c.end - c.start) + 1);
-    const kind = classifyBytes(slice);
+    // Later ranges win on overlap (a fresh page write is more current than
+    // an old whole-chip scan of the same bytes), so check in order and keep
+    // the last hit rather than stopping at the first.
+    let hit = null;
+    for (const s of ranges) {
+      const off = c.start - s.start;
+      if (off < 0 || off + (c.end - c.start) >= s.bytes.length) continue;
+      hit = s.bytes.subarray(off, off + (c.end - c.start) + 1);
+    }
+    if (!hit) continue;
+    const kind = classifyBytes(hit);
     c.elt.classList.remove("blank", "zero", "data", "reading");
     c.elt.classList.add("scanned", kind);
-    const preview = Array.from(slice.subarray(0, 8))
+    const preview = Array.from(hit.subarray(0, 8))
       .map((b) => b.toString(16).toUpperCase().padStart(2, "0"))
       .join(" ");
     c.elt.dataset.note =
       `${kind === "blank" ? "blank (all 0xFF)" : kind === "zero" ? "all 0x00 — a SECURED part reads like this" : "programmed"}` +
-      `  [${preview}${slice.length > 8 ? " …" : ""}]`;
+      `  [${preview}${hit.length > 8 ? " …" : ""}]`;
   }
 }
 
@@ -845,13 +860,18 @@ async function scanRange(key, start, len) {
   for (let i = 0; i < len; i++) {
     bytes[i] = parseInt(d.hex.substr(i * 2, 2), 16);
   }
-  const prev = scanned[key];
-  if (prev && prev.start === start && prev.bytes.length >= len) {
-    prev.bytes.set(bytes, 0);
-  } else if (prev && prev.start <= start) {
+  const ranges = (scanned[key] = scanned[key] || []);
+  // Patch in place if this exactly re-reads (or extends) a range we already
+  // have; otherwise it's a disjoint range (e.g. a single FLASH page written
+  // far from anything scanned before) and gets appended, not merged into a
+  // buffer that would have to fabricate the gap in between.
+  const prev = ranges.find(
+    (r) => r.start <= start && start + len <= r.start + r.bytes.length
+  );
+  if (prev) {
     prev.bytes.set(bytes, start - prev.start);
   } else {
-    scanned[key] = { start, bytes };
+    ranges.push({ start, bytes });
   }
   applyScan(key);
   return d;
