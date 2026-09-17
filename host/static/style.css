@@ -1383,7 +1383,15 @@ canvas.pin-scope {
 .pkg-tip .td { color: var(--text-dim); }
 
 .pkg-note { margin: 0 0 9px; line-height: 1.5; }
-.pkg-foot { margin-top: 10px; line-height: 1.5; }
+.pkg-foot {
+  margin-top: 10px;
+  line-height: 1.5;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.pkg-foot #pkg-foot-text { flex: 1 1 260px; }
 
 /* -- themed scrollbars -------------------------------------------------- */
 * {

@@ -5723,3 +5723,355 @@ Programmed with the blinky at $E000 (189 bytes, verified byte-for-byte after
 the test run), **running**, unsecured (FOPT 0xC2 / NVOPT 0xFE), link live at
 9.249 MHz. A full pre-test backup of the array is at
 `host/backups/20260916-211506_dump_E000-FFFF.s19`.
+
+## FOURTEENTH session (2026-09-17) — Finding 92 was wrong: $0060-$006F is not RAM
+
+### Finding 120 — CORRECTION to Finding 92/106: the "RAM defect" at $0060-$006F is TPM2 and RTC peripheral registers behaving completely normally, not damaged silicon
+
+While writing target C code that touches the RTC module, `RTCSC_RTCLKS(1)`
+failed to compile (`C1844: Call-operator applied to non-function`) because
+that macro doesn't exist in this chip's real header. Fetching the actual
+CodeWarrior-generated header (now checked into the repo at
+`docs/mc9s08sg8.h` — see `docs/README.md`) to get the real macro name
+turned up its full register address list, and it directly contradicts
+Finding 92/106:
+
+```
+0x00000060  TPM2SC     0x00000061  TPM2CNT    0x00000063  TPM2MOD
+0x00000065  TPM2C0SC   0x00000066  TPM2C0V    0x00000068  TPM2C1SC
+0x00000069  TPM2C1V    0x0000006C  RTCSC      0x0000006D  RTCCNT
+0x0000006E  RTCMOD
+```
+
+Registers run contiguously from $0000 through $006E, then jump straight to
+the high-page block at $1800 — there is no RAM in between. This matches
+the datasheet's own Figure 4-1 (RAM starts at $0080, not $0060) and
+contradicts this project's working assumption, used since early in the
+project, that general-purpose RAM begins at $0060.
+
+Finding 92's own data proves it, once you index it against the real
+register map instead of assuming RAM:
+
+```
+addr   wrote  read   register            why
+$0060   FF     7F    TPM2SC              reserved/status bits, not a plain byte
+$0061   FF     00    TPM2CNT (hi)        free-running counter: any write clears it
+$0062   FF     00    TPM2CNT (lo)        same
+$0063   FF     FF    TPM2MOD (hi)        plain read/write value -- sticks
+$0064   FF     FF    TPM2MOD (lo)        same
+$0065   FF     7C    TPM2C0SC            reserved bits
+$0066   FF     FF    TPM2C0V (hi)        plain value -- sticks
+$0067   FF     FF    TPM2C0V (lo)        same
+$0068   FF     7C    TPM2C1SC            reserved bits (same pattern as C0SC)
+$0069   FF     FF    TPM2C1V (hi)        plain value -- sticks
+$006A   FF     FF    TPM2C1V (lo)        same
+$006B   FF     00    (unimplemented)
+$006C   FF     7F    RTCSC               reserved bits
+$006D   FF     00    RTCCNT              free-running counter: write clears it
+$006E   FF     FF    RTCMOD              plain value -- sticks
+$006F   FF     00    (unimplemented)
+```
+
+Every single byte is exactly what a real, healthy TPM2 + RTC module should
+do when you write 0xFF to it -- reserved/status bits masking down, live
+counters resetting on write, and plain value registers holding what you
+wrote. There is no per-address damage pattern here; there was never a
+defective chip. **Retract Finding 92's "fixed per-address AND mask,
+confined to $0060-$0069F" framing and Finding 106's "the defect has
+spread" follow-on** -- both were real, honestly-reported measurements, but
+misdiagnosed because the project had the wrong RAM start address.
+
+**What this changes:** nothing downstream turns out to depend on the wrong
+address. The SG4/SG8 identification test (`$0240` readable) sits well
+inside genuine RAM on both readings of the map and is unaffected. No code
+in `firmware/` or `host/` treated $0060-$006F as scratch RAM. This is a
+correction to the project's own understanding, not a functional bug fix --
+recorded here so nobody re-opens "is this chip's RAM damaged" as a live
+question. It is not; there is no evidence of that anywhere in this
+project's history once this region is read correctly as TPM2 + RTC.
+
+**Where real RAM actually starts:** $0080 per the datasheet's Figure 4-1
+(SG8: 512 bytes, $0080-$027F). Anything that iterates "RAM starting at
+$0060" (if such code exists anywhere -- a search turned up none in the
+current `firmware/`/`host/` tree) should be corrected to $0080.
+## FIFTEENTH session (2026-09-17) — an example-firmware library, and the RTC prescaler question closed
+
+### Finding 121 — ***THE RTC PRESCALER WAS NEVER WRONG.*** RTCPS=15 is divide-by-1000; the "2x too slow" was RTCMOD semantics and a period-vs-toggle-interval mismatch
+
+The FOURTEENTH session left an open, explicitly-unresolved item: an
+RTC-based delay measured **~2.11 s where 1.0 s was intended**, with the
+leading hypothesis that Table 13-3's decimal divide-by ordering (1, 2, 4,
+10, 16, 100, 500, 1000 for RTCPS 8-15) had been reconstructed wrongly from
+a garbled PDF text extraction.
+
+**That hypothesis was wrong. The table reading was correct.** Confirmed
+three independent ways before touching hardware:
+
+1. **`pdftotext -raw` instead of `-layout`.** The `-layout` mode lays
+   Table 13-3 out by column position and scrambles it; `-raw` returns true
+   reading order and gives the same sequence that had been suspected:
+   `Off 2^3 2^5 2^6 2^7 2^8 2^9 2^10 1 2 2^2 10 2^4 10^2 5x10^2 10^3`.
+2. **Table 13-6 is the same information without superscripts to garble** --
+   it states prescaler *periods* directly. 1 kHz column: RTCPS `1110` ->
+   0.5 s, `1111` -> **1 s**. Every row agrees with Table 13-3.
+3. **The datasheet's own worked example** (Figure 13-6): "the prescaler
+   (RTCPS) is set to 0xA or divide-by-4". 0xA = 10 -> 2^2 = 4. Anchored.
+
+The real 2x has two candidate causes, both genuine:
+
+- **RTCMOD is a modulo, not a count.** The flag period is
+  `(RTCMOD + 1)` prescaler ticks. Table 13-5: a value of 0x00 "sets the
+  RTIF bit on each rising edge of the prescaler output".
+- **"Period" is ambiguous for a toggling pin.** Toggling once per flag
+  makes a full square-wave cycle twice the flag interval.
+
+Disassembling what was actually left on the chip settles which applied. The
+program still in FLASH at $F000 read (opcodes decoded by hand):
+
+```
+b6 6c    LDA  $6C         RTCSC
+a4 9f    AND  #$9F        RTCLKS = 00 (1 kHz LPO)
+b7 6c    STA  $6C
+b6 6c    LDA  $6C
+a4 f0    AND  #$F0
+aa 0e    ORA  #$0E        RTCPS = 0x0E = 14  <-- FOURTEEN, not fifteen
+b7 6c    STA  $6C
+6e 01 6e MOV  #$01,$6E    RTCMOD = 1
+0f 6c fd BRCLR 7,$6C,-3   poll RTIF
+1e 6c    BSET 7,$6C       clear RTIF by writing 1
+```
+
+So it was `RTCPS = 14` (divide-by-500 = 0.5 s) with `RTCMOD = 1` (two
+ticks) = **1.0 s between flags** -- which is correct -- and therefore a
+**2.0 s full square wave**. The "~2.11 s" was simply its full period,
+compared against a "1 second" that meant the flag interval. The prescaler
+was never at fault, and the earlier session's own note that it had used
+"RTCPS=15" was itself a misremembering of the code it wrote.
+
+**Measured on hardware to close it.** `target-firmware/examples/rtc_timebase`
+was built with the unambiguous configuration `RTCPS = 15` (divide-by-1000)
+and `RTCMOD = 0` (one tick), flashed (187 bytes, both pages verified
+byte-for-byte on read-back), and PTAD polled over BDM at ~30 Hz for 30 s:
+
+```
+885 samples, 27 toggle intervals
+mean toggle interval    1.0764 s     (nominal 1.000 s)
+full square-wave period 2.153 s
+```
+
+2.153 s against the earlier session's 2.11 s -- the same measurement. The
+residual **+7.6%** is the LPO itself: ~929 Hz rather than 1000 Hz, i.e. a
+1076 us period, inside the datasheet's tLPO spec of **700 us min /
+1500 us max**. Nothing is out of tolerance. The 1 kHz LPO is simply not a
+precision reference, and any "exact 1 second" built on it is exact only to
+about +/-30% by specification.
+
+**Carry forward:** `pdftotext -layout` scrambles the column order of
+several tables in this datasheet in ways that produce plausible but wrong
+encodings. Table 9-7 (ADC conversion mode) is another: `-layout` suggests
+10-bit might be encoding `01`, while `-raw` shows it is `10` (00 = 8-bit,
+01 = Reserved, 10 = 10-bit, 11 = Reserved). Use `-raw` for tables, and
+prefer a table that states the same thing a second way where one exists.
+
+### Finding 122 — changing BDIV kills the BDM link, demonstrated instead of predicted
+
+`BDCSCR`'s `CLKSW` selects the BDC communications clock: 0 = alternate BDC
+clock, **1 = MCU bus clock**. This rig reads `CLKSW = 1` (`/api/chip_info`
+reports `bdc_clock_hz == bus_clock_hz`, and `host/app.py` already depends
+on it for FCDIV). The consequence had been reasoned about but never tested.
+
+`target-firmware/examples/ics_oscillator` sets `ICSC2_BDIV = 2` (divide by
+4, from the reset default of 01 = divide by 2). Single-stepped from a
+power-on BDM entry:
+
+```
+after 60 steps:  RAM $0100..$0103 = 04 40 80 10 -- the program's snapshot of
+                 ICSC1/ICSC2/ICSTRM/ICSSC, byte-identical to those four
+                 registers read independently off the halted chip
+after 4 more:    the BDIV write executes, and the NEXT BDM TRANSFER FAILS
+```
+
+The link stopped decoding the instant the bus clock halved, exactly as
+`CLKSW = 1` implies. **Recovery is clean:** `/api/sync` re-entered at
+9,195,402 Hz, because its entry is a *power-on* reset and therefore happens
+before `main()` touches BDIV. So this is a "cannot watch it free-running"
+hazard, not a brick.
+
+Also confirmed off the halted chip, matching the documented reset state
+exactly: `ICSC1 = 0x04` (IREFS = 1, FEI mode), `ICSC2 = 0x40` (BDIV = 01,
+divide by 2), `ICSTRM = 0x80`, `ICSSC = 0x10` (IREFST = 1, FTRIM = 0).
+
+### Finding 123 — two independent measurements of the bus clock agree to 1-2%
+
+`examples/timer_tpm` runs TPM2 free from the bus clock with PS = 111
+(/128) and TPM2MOD = 0xFFFF, so its period is `65536 x 128 / f_bus` by
+construction. Measured by polling PTAD over BDM for 40 s:
+
+```
+duty         25.5 %     (expected 25.0 % = 0x4000 / 65536)
+full period  0.9231 s   (mean of 85 cycles)
+-> implied f_bus = 65536 x 128 / 0.9231 = 9,087,306 Hz
+```
+
+The BDC SYNC bit-rate measurement -- a completely different mechanism --
+gave **9,195,402 to 9,302,326 Hz** across the same session. Agreement to
+~1-2% simultaneously confirms that `CLKSx = 01` really is the bus rate
+clock (datasheet Table 16-6), that `PS = 111` really is divide-by-128
+(Table 16-7), and this project's standing "the SYNC rate is fBus on this
+part" assumption (Finding 94).
+
+For reference, the reset bus clock is the **untrimmed** DCO divided down:
+`fdco_ut` is specified 25.6 / 36.86 / 42.66 MHz (min/typ/max), and
+`BUSCLK = DCOOUT / (2 x BDIV)` with BDIV = 01 at reset, so ~9.2 MHz sits
+right at the typical. Part-to-part this can legitimately be 6.4-10.7 MHz.
+
+### Finding 124 — the ADC can be verified with no analog wiring at all, and it measures the supply as a by-product
+
+No port pin on this rig is wired (Finding 117), so an external-channel ADC
+example would convert a floating pin and prove nothing. The ADC's internal
+channels need no external circuit: **AD29 = VREFH (tied to VDD)**,
+**AD30 = VREFL (tied to VSS)**, AD26 = temperature sensor, AD27 = internal
+bandgap (requires `SPMSC1_BGBE = 1`, which lives outside the ADC's own
+registers and is easy to miss).
+
+Converting VREFH and VREFL is a complete self-test, since they *are* the
+converter's own reference rails. `examples/adc_read` measured, running:
+
+```
+VREFH   = 0x03F8 = 1016 / 1023   99.3 % of full scale
+VREFL   = 0x0000 =    0          exactly zero
+TEMP    = 0x01BB =  443
+BANDGAP = 0x0189 =  393
+```
+
+The bandgap reading yields the supply voltage, which is the datasheet's own
+documented use for AD27. With `VBG` = 1.20 V typ (Section A.6):
+
+```
+VDD = 1.20 x 1023 / 393 = 3.12 V
+```
+
+-- a sensible figure for a target powered from the Pico, and a further
+independent sign the conversions are real.
+
+**Honest limit:** section 9.1.4 requires the *temperature sensor*
+specifically to be read "with long sample and a maximum of 1 MHz clock".
+ADCK here is bus/4 ~= 2.3 MHz, which is fine for VREFH/VREFL/bandgap (the
+`fADCK` spec is 0.4-8.0 MHz at ADLPC = 0) but above what 9.1.4 asks. The
+recorded AD26 value is therefore **not** a datasheet-compliant temperature
+measurement. `ADCCFG_ADIV = 3` would give ~578 kHz and fix it; the example
+is deliberately left as built so its source matches the binary measured.
+
+### Finding 125 — `/api/relink` is unreliable against some free-running programs; single-stepping from reset is the fallback that always worked
+
+Recovering the link after `reset_target` + `go` needed `/api/relink`, and
+its success rate turned out to be program-dependent rather than random:
+
+```
+blinky          relink validated on try 1
+timer_tpm       relink validated on try 0-1
+adc_read        relink validated on try 1
+sci_uart        relink validated on try 0
+rtc_timebase    relink validated on try 1
+gpio_blink      relink FAILED 8 times in a row, twice over
+```
+
+Against `gpio_blink` -- whose loop is a bare read-modify-write of PTAD at
+full bus speed -- SYNC's raw measurement also came back inconsistent
+(15.84 MHz on some attempts, 18.60 MHz on others) and neither that rate nor
+its half validated. No cause established; recorded as an observation.
+
+**The fallback that never failed** is to skip free-running entirely:
+`/api/sync` (power-on entry, halted) and then single-step with `/api/step`,
+reading registers or RAM after each step. The target stays in active
+background mode so the link never has to be re-measured. `gpio_blink` was
+verified this way in 57 steps (PTADD = 0x01, PTAPE = 0x02, PTAD = 0x02 with
+the pulled-up input high, then PTAD = 0x03 once the mirror loop ran), and
+`ics_oscillator` in 60. It is slow (~17 ms per step round trip) but exact,
+and it is the only method that works for a program the link cannot survive
+free-running (Finding 122).
+
+**Also worth knowing:** programming a *free-running* target fails with
+`BdcError: read of $1825: target reports DVF (data valid failure) in
+BDCSCR = 0xFF`. It fails safely -- the report came back `erased=False,
+programmed=0`, and the existing image was intact -- but `/api/sync` must
+come first. Every flash in this session was preceded by a sync and followed
+by a byte-for-byte read-back comparison against the source `.s19`.
+
+One transient remains unexplained: an early `timer_tpm` flash reported all
+pages verified, yet `$E000` read back blank afterwards while the reset
+vector survived. It did not reproduce -- the same image reflashed, verified,
+ran, and still verified afterwards -- so it is recorded, not diagnosed.
+
+### Finding 126 — `target-firmware/examples/`: six peripheral examples, each honest about its own verification
+
+New library at `target-firmware/examples/`, one folder per peripheral, each
+a single `main.c` following `target-firmware/blinky/`'s bareboard pattern
+(no Processor Expert, COP disabled via `SOPT1 = 0x00`), plus a README
+stating exactly what was and was not verified. Index at
+`target-firmware/examples/README.md`.
+
+```
+gpio_blink      input + internal pull-up mirrored to an output   hardware verified
+timer_tpm       TPM2 free-running /128, variable-duty wave       hardware verified
+rtc_timebase    RTC off the 1 kHz LPO, 1 s time base             hardware verified
+ics_oscillator  ICS registers + BDIV bus-clock change            hardware verified except
+                                                                 the blink -- see Finding 122
+sci_uart        SCI transmit, baud divisor, TDRE/TC              PARTIAL -- configured and
+                                                                 transmitting, nothing received
+adc_read        ADC on internal VREFH/VREFL/bandgap/temp         hardware verified
+```
+
+`gpio_blink` deliberately does **not** re-implement blinky: the existing
+`target-firmware/blinky/` remains the "toggle one output" starting point,
+and this covers reading an input with a pull-up instead. The pull-up is
+load-bearing for testability, not decoration -- with nothing wired to any
+port pin, a floating input has no defined value to check. That is visible
+in the data: PTA1 (pulled up) read a steady 1 while PTA2 (unconnected, no
+pull-up) flickered between samples in the same register byte.
+
+Worth recording from the header read: **Port A on this part is four bits
+wide.** `docs/mc9s08sg8.h` defines `PTAD_PTAD0..PTAD_PTAD3` and nothing
+above, matching the 20-TSSOP pinout. pico-bdm's live-state panel reports
+PTA0-PTA7 because it prints the raw register byte; the top four bits are
+not real pins on this device. Port B is the full eight.
+
+**`sci_uart` is the one to read carefully.** PTB1/TxD is physical pin 15
+and is not wired to anything, so no byte was ever received or scoped. What
+*was* confirmed is that `SCIBD = 60` (the computed divisor, ~9634 baud),
+`SCIC1 = 0x00` (8N1), `SCIC2 = 0x08` (TE set), and that `SCIS1` was caught
+reading `0x00` -- both TDRE and TC clear, i.e. the transmitter genuinely
+mid-character -- as well as `0xC0` when idle. Configured and transmitting;
+framing and bit timing unconfirmed. The README says so plainly.
+
+### State the target was left in
+
+**Restored to the known-good blinky**, deliberately, as the last hardware
+action of the session. `target-firmware/blinky/main.c` built fresh,
+programmed (197 bytes: 195 at $E000, 2 at $FFFE), **verified byte-for-byte
+on read-back**, and confirmed running: `PTADD = 0x01` and PTAD alternating
+across a 10 s poll. Unsecured (FOPT 0xC2 / NVOPT 0xFE), link live at
+9,302,326 Hz.
+
+Note the chip did **not** start this session holding blinky, despite
+Finding 119's note -- it held the FOURTEENTH session's RTC experiment,
+linked at $F000 with $E000 erased and the reset vector at $F07B. That
+program is the one disassembled in Finding 121.
+
+### A build-method caveat on this session's binaries
+
+The `.s19` images flashed and measured above were produced by driving
+CodeWarrior's batch tools (`piper.exe` + `chc08.exe` + `linker.exe` +
+`burner.exe`) from the command line rather than through the IDE. That
+approach was **abandoned mid-session** because it surfaces real GUI dialogs
+on the desktop rather than running headless, and it should not be repeated
+-- the canonical build route is the IDE one documented in
+`target-firmware/blinky/README.md`, which is what every example's README
+describes.
+
+The binaries themselves are sound and were validated before use: building
+`blinky/main.c` this way produced a `.init` startup section
+**byte-for-byte identical** to the blinky image already proven on this chip,
+and the same reset vector (0xE07B). All six examples compiled and linked
+with **0 errors and 0 warnings**. Each should still be rebuilt in the IDE
+before being treated as canonical.

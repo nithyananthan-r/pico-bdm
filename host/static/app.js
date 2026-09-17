@@ -956,8 +956,11 @@ function pollInterval() {
 
 function startPolling() {
   if (pollTimer) return;
-  $("poll-btn").textContent = "Stop polling";
-  $("poll-btn").classList.add("on");
+  [$("poll-btn"), $("pkg-poll-btn")].forEach((b) => {
+    if (!b) return;
+    b.textContent = "Stop polling";
+    b.classList.add("on");
+  });
   const tick = async () => {
     await pollOnce();
     if (pollTimer) pollTimer = setTimeout(tick, pollInterval());
@@ -968,14 +971,20 @@ function startPolling() {
 function stopPolling() {
   if (pollTimer) clearTimeout(pollTimer);
   pollTimer = null;
-  $("poll-btn").textContent = "Start polling";
-  $("poll-btn").classList.remove("on");
+  [$("poll-btn"), $("pkg-poll-btn")].forEach((b) => {
+    if (!b) return;
+    b.textContent = "Start polling";
+    b.classList.remove("on");
+  });
   $("poll-rate").textContent = "stopped";
   document.querySelectorAll(".pin").forEach((p) => p.classList.add("stale"));
   updatePackage(null);
 }
 
 $("poll-btn").addEventListener("click", () =>
+  pollTimer ? stopPolling() : startPolling()
+);
+$("pkg-poll-btn").addEventListener("click", () =>
   pollTimer ? stopPolling() : startPolling()
 );
 
@@ -1395,12 +1404,12 @@ function applyPackageState() {
     g.classList.add(live.level ? "hi" : "lo");
     g.classList.add(live.direction === "out" ? "out" : "in");
   }
-  const foot = $("pkg-foot");
+  const foot = $("pkg-foot-text");
   if (foot) {
     foot.textContent = pkgStale
-      ? "No live reading. Open Features → Live state & debugger and press " +
-        "Start polling; every pin here comes from that same /api/live_state " +
-        "snapshot, so nothing is drawn until the target has answered."
+      ? "No live reading yet — press Start polling below; every pin here " +
+        "comes from the same /api/live_state snapshot the debugger panel " +
+        "uses, so nothing is drawn until the target has answered."
       : "Live from /api/live_state — PTA/PTB/PTC data and direction " +
         "registers, read over BDM. PTC is read and reported raw; it is " +
         "bonded out on the 20-pin package (pins 9–12) but not on smaller ones.";
